@@ -50,6 +50,34 @@
 #define IPO_IATTR_CONNECT_SQE(x)	\
 	(cpu_to_le32(offsetof(struct nvmf_connect_command, x)))
 
+#ifdef CONFIG_NVME_TARGET_NDP_MODULE
+// HACK: bookmark
+// void nvmet_execute_download_ndpm(struct nvmet_req *req);
+// void nvmet_execute_activate_ndpm(struct nvmet_req *req);
+
+struct nvme_ndp_kern {
+	// TODO: kern data
+};
+
+extern struct ndp_module nvmet_code_module;
+
+enum nvmet_ndp_module_eft {
+	NVMET_NDP_MODULE_EBPF		= 0x01,
+};
+
+struct ndp_module {
+	bool loaded;
+	u8 eft;
+	bool persist;
+	bool shared;
+	int priv_level;
+	// Code of loaded module
+	
+	u32 code_len;
+	void *module;
+};
+#endif
+
 struct nvmet_ns {
 	struct list_head	dev_link;
 	struct percpu_ref	ref;
@@ -77,6 +105,11 @@ struct nvmet_ns {
 
 	int			use_p2pmem;
 	struct pci_dev		*p2p_dev;
+
+#ifdef CONFIG_NVME_TARGET_NDP_MODULE
+	struct sk_filter __rcu * ns_filter;
+	atomic_t	ns_omem_alloc;	
+#endif
 };
 
 static inline struct nvmet_ns *to_nvmet_ns(struct config_item *item)
@@ -520,27 +553,6 @@ static inline __le16 to0based(u32 a)
 }
 
 #ifdef CONFIG_NVME_TARGET_NDP_MODULE
-// HACK: bookmark
-// void nvmet_execute_download_ndpm(struct nvmet_req *req);
-// void nvmet_execute_activate_ndpm(struct nvmet_req *req);
-
-extern struct ndp_module nvmet_code_module;
-
-enum nvmet_ndp_module_eft {
-	NVMET_NDP_MODULE_EBPF		= 0x01,
-};
-
-struct ndp_module {
-	bool loaded;
-	u8 eft;
-	bool persist;
-	bool shared;
-	int priv_level;
-	// Code of loaded module
-	u32 code_len;
-	void *module;
-};
-
 void nvmet_file_execute_ndp_module_mgmt(struct nvmet_req *req);
 // void nvmet_file_execute_ndp_copy(struct nvmet_req *req);
 #endif

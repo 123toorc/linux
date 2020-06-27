@@ -8,6 +8,11 @@
 #include <linux/module.h>
 #include "nvmet.h"
 
+#ifdef CONFIG_NVME_TARGET_NDP_MODULE
+#include <linux/filter.h>
+#include <linux/bpf.h>
+#endif
+
 void nvmet_bdev_set_limits(struct block_device *bdev, struct nvme_id_ns *id)
 {
 	const struct queue_limits *ql = &bdev_get_queue(bdev)->limits;
@@ -324,11 +329,195 @@ static void nvmet_bdev_execute_write_zeroes(struct nvmet_req *req)
 }
 
 #ifdef CONFIG_NVME_TARGET_NDP_MODULE
-static void ndp_module_dl_volatile(struct nvmet_req *req, struct ndp_module *module) {
-	int sg_cnt = req->sg_cnt;
-	char *data;
 
-	if (!sg_cnt) {
+// ==================
+//        BPF
+// ==================
+static bool bpf_check_basics_ok(const struct sock_filter *filter,
+				unsigned int flen)
+{
+	if (filter == NULL)
+		return false;
+	if (flen == 0 || flen > BPF_MAXINSNS)
+		return false;
+
+	return true;
+}
+
+static int bpf_prog_store_orig_filter(struct bpf_prog *fp,
+				      const struct sock_fprog *fprog)
+{
+	unsigned int fsize = bpf_classic_proglen(fprog);
+	struct sock_fprog_kern *fkprog;
+
+	fp->orig_prog = kmalloc(sizeof(*fkprog), GFP_KERNEL);
+	if (!fp->orig_prog)
+		return -ENOMEM;
+
+	fkprog = fp->orig_prog;
+	fkprog->len = fprog->len;
+
+	fkprog->filter = kmemdup(fp->insns, fsize,
+				 GFP_KERNEL | __GFP_NOWARN);
+	if (!fkprog->filter) {
+		kfree(fp->orig_prog);
+		return -ENOMEM;
+	}
+
+	return 0;
+}
+
+static
+struct bpf_prog *__get_filter(struct sock_fprog *fprog)
+{
+	unsigned int fsize = bpf_classic_proglen(fprog);
+	struct bpf_prog *prog;
+	int err;
+
+	if (!bpf_check_basics_ok(fprog->filter, fprog->len))
+		return ERR_PTR(-EINVAL);
+
+	prog = bpf_prog_alloc(bpf_prog_size(fprog->len), 0);
+	if (!prog)
+		return ERR_PTR(-ENOMEM);
+	
+	if (copy_from_user(prog->insns, fprog->filter, fsize)) {
+		bpf_prog_free(prog);
+		return ERR_PTR(-EFAULT);
+	}
+
+	prog->len = fprog->len;
+
+	err = bpf_prog_store_orig_filter(prog, fprog);
+
+	if (err) {
+		bpf_prog_free(prog);
+		return ERR_PTR(-ENOMEM);
+	}
+
+	return bpf_prepare_filter(prog, NULL);
+}
+
+extern int sysctl_optmem_max;
+
+static bool __ns_filter_charge(struct nvmet_ns *ns, struct sk_filter *fp)
+{
+	u32 filter_size = bpf_prog_size(fp->prog->len);
+
+	if (filter_size <= sysctl_optmem_max &&
+	    atomic_read(&ns->ns_omem_alloc) + filter_size < sysctl_optmem_max) {
+		atomic_add(filter_size, &ns->ns_omem_alloc);
+		return true;
+	}
+	return false;
+}
+
+static void bpf_release_orig_filter(struct bpf_prog *fp)
+{
+	struct sock_fprog_kern *fprog = fp->orig_prog;
+
+	if (fprog) {
+		kfree(fprog->filter);
+		kfree(fprog);
+	}
+}
+
+static void __bpf_prog_release(struct bpf_prog *prog)
+{
+	if (prog->type == BPF_PROG_TYPE_NVME_NDP) {
+		bpf_prog_put(prog);
+	} else {
+		bpf_release_orig_filter(prog);
+		bpf_prog_free(prog);
+	}
+}
+
+static void __ns_filter_release(struct sk_filter *fp)
+{
+	__bpf_prog_release(fp->prog);
+	kfree(fp);
+}
+
+/**
+ * 	sk_filter_release_rcu - Release a socket filter by rcu_head
+ *	@rcu: rcu_head that contains the sk_filter to free
+ */
+static void ns_filter_release_rcu(struct rcu_head *rcu)
+{
+	struct sk_filter *fp = container_of(rcu, struct sk_filter, rcu);
+
+	__ns_filter_release(fp);
+}
+
+/**
+ *	sk_filter_release - release a socket filter
+ *	@fp: filter to remove
+ *
+ *	Remove a filter from a socket and release its resources.
+ */
+static void ns_filter_release(struct sk_filter *fp)
+{
+	if (refcount_dec_and_test(&fp->refcnt))
+		call_rcu(&fp->rcu, ns_filter_release_rcu);
+}
+
+static void ns_filter_uncharge(struct nvmet_ns *ns, struct sk_filter *fp)
+{
+	u32 filter_size = bpf_prog_size(fp->prog->len);
+
+	atomic_sub(filter_size, &ns->ns_omem_alloc);
+	ns_filter_release(fp);
+}
+
+static int __ns_attach_prog(struct bpf_prog *prog, struct nvmet_ns *ns)
+{
+	struct sk_filter *fp, *old_fp;
+
+	fp = kmalloc(sizeof(*fp), GFP_KERNEL);
+	if (!fp)
+		return -ENOMEM;
+
+	fp->prog = prog;
+
+	if (!__ns_filter_charge(ns, fp)) {
+		kfree(fp);
+		return -ENOMEM;
+	}
+	refcount_set(&fp->refcnt, 1);
+
+	old_fp = rcu_dereference_protected(ns->ns_filter,
+					   lockdep_sock_is_held(ns));
+	rcu_assign_pointer(ns->ns_filter, fp);
+
+	if (old_fp)
+		ns_filter_uncharge(ns, old_fp);
+
+	return 0;
+}
+
+int ndp_attach_bpf(struct sock_fprog *fprog, struct nvmet_ns *ns) {
+	struct bpf_prog *prog = __get_filter(fprog);
+	int err;
+
+	if (IS_ERR(prog))
+		return PTR_ERR(prog);
+
+	err = __ns_attach_prog(prog, ns);
+	if (err < 0) {
+		__bpf_prog_release(prog);
+		return err;
+	}
+
+	return err;
+}
+
+static void ndp_module_dl_volatile(struct nvmet_req *req, struct ndp_module *module) {
+	size_t code_len = module->code_len;
+	int sg_cnt = req->sg_cnt;
+	int sg_len = req->sg->length;
+	void *data;
+
+	if (!sg_cnt || code_len > sg_len) {
 		// TODO: SC ERROR
 		nvmet_req_complete(req, 0);
 		return;
@@ -336,8 +525,9 @@ static void ndp_module_dl_volatile(struct nvmet_req *req, struct ndp_module *mod
 
 	data = sg_virt(req->sg);
 	// TODO!: alloc and memcpy
+	module->module = vmalloc(code_len);
+	memcpy(module->module, data, code_len);
 	module->loaded = true;
-	printk(data);
 	nvmet_req_complete(req, 0);
 }
 

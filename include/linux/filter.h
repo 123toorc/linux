@@ -866,6 +866,10 @@ void bpf_prog_destroy(struct bpf_prog *fp);
 const struct bpf_func_proto *
 bpf_base_func_proto(enum bpf_func_id func_id);
 
+// HACK
+struct bpf_prog *bpf_prepare_filter(struct bpf_prog *fp,
+					   bpf_aux_classic_check_t trans);
+
 int sk_attach_filter(struct sock_fprog *fprog, struct sock *sk);
 int sk_attach_bpf(u32 ufd, struct sock *sk);
 int sk_reuseport_attach_filter(struct sock_fprog *fprog, struct sock *sk);

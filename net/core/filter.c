@@ -1286,7 +1286,8 @@ out_err:
 	return ERR_PTR(err);
 }
 
-static struct bpf_prog *bpf_prepare_filter(struct bpf_prog *fp,
+// static
+struct bpf_prog *bpf_prepare_filter(struct bpf_prog *fp,
 					   bpf_aux_classic_check_t trans)
 {
 	int err;
@@ -1324,6 +1325,7 @@ static struct bpf_prog *bpf_prepare_filter(struct bpf_prog *fp,
 
 	return fp;
 }
+EXPORT_SYMBOL_GPL(bpf_prepare_filter);
 
 /**
  *	bpf_prog_create - create an unattached filter
@@ -8985,6 +8987,94 @@ const struct bpf_verifier_ops sk_reuseport_verifier_ops = {
 const struct bpf_prog_ops sk_reuseport_prog_ops = {
 };
 #endif /* CONFIG_INET */
+
+#ifdef CONFIG_NVME_TARGET_NDP_MODULE
+
+static const struct bpf_func_proto *
+nvme_ndp_func_proto(enum bpf_func_id func_id,
+			const struct bpf_prog *prog)
+{
+	switch (func_id) {
+	case BPF_FUNC_skb_load_bytes:
+		return &bpf_skb_load_bytes_proto;
+	case BPF_FUNC_skb_load_bytes_relative:
+		return &bpf_skb_load_bytes_relative_proto;
+	default:
+		return bpf_base_func_proto(func_id);
+	}
+}
+
+static bool __is_valid_nvme_ndp_access(int off, int size)
+{
+	if (off < 0 || off >= sizeof(struct nvme_ndp_buff))
+		return false;
+	if (off % size != 0)
+		return false;
+	if ( !(size == sizeof(__u64) || size == sizeof(__u32)) )
+		return false;
+
+	return true;
+}
+
+static bool nvme_ndp_is_valid_access(int off, int size,
+			     enum bpf_access_type type,
+			     const struct bpf_prog *prog,
+			     struct bpf_insn_access_aux *info)
+{
+	printk("%s: off %x size %d total %ld\n", __func__, off, size, sizeof(struct nvme_ndp_buff));
+
+	if (type == BPF_WRITE) 
+		return false;
+
+	switch (off) {
+	case offsetof(struct nvme_ndp_buff, data):
+		info->reg_type = PTR_TO_PACKET;
+		break;
+	case offsetof(struct nvme_ndp_buff, data_end):
+		info->reg_type = PTR_TO_PACKET_END;
+		break;
+	}
+
+	return __is_valid_nvme_ndp_access(off, size);
+}
+
+static u32 nvme_ndp_convert_ctx_access(enum bpf_access_type type,
+					   const struct bpf_insn *si,
+					   struct bpf_insn *insn_buf,
+					   struct bpf_prog *prog,
+					   u32 *target_size)
+{
+	struct bpf_insn *insn = insn_buf;
+
+	printk("%s: si->off %x access_type %d\n", __func__, si->off, type);
+
+	//TODO TODO TODO need to decide the structure of what we give into eBPF
+	switch (si->off) {
+	case offsetof(struct nvme_ndp_buff, data): 
+	case offsetof(struct nvme_ndp_buff, data_end): 
+	printk("%s: GENERATING 64bit access\n", __func__);
+		*insn++ = BPF_LDX_MEM(BPF_FIELD_SIZEOF(struct nvme_ndp_buff, data), // kernel view
+				      si->dst_reg, si->src_reg,
+				      si->off);
+		break;
+	}
+
+	return insn - insn_buf;
+}
+
+const struct bpf_verifier_ops nvme_ndp_verifier_ops = {
+    /* this gives pointers to the helper functions */
+    .get_func_proto = nvme_ndp_func_proto,
+    /* for every offset in the passed in struct checks if the access is valid */
+    .is_valid_access = nvme_ndp_is_valid_access,
+    /* converts instructions that are operating on context (current data) */
+    .convert_ctx_access = nvme_ndp_convert_ctx_access,
+};
+
+const struct bpf_prog_ops nvme_ndp_prog_ops = {
+};
+
+#endif
 
 DEFINE_BPF_DISPATCHER(xdp)
 

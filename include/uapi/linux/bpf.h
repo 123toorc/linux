@@ -184,6 +184,7 @@ enum bpf_prog_type {
 	BPF_PROG_TYPE_STRUCT_OPS,
 	BPF_PROG_TYPE_EXT,
 	BPF_PROG_TYPE_LSM,
+	BPF_PROG_TYPE_NVME_NDP,
 };
 
 enum bpf_attach_type {
@@ -3949,4 +3950,13 @@ struct bpf_pidns_info {
 	__u32 pid;
 	__u32 tgid;
 };
+
+#ifdef CONFIG_NVME_TARGET_NDP_MODULE
+struct nvme_ndp_buff {
+	// TODO: check NVME_IO_WRITE
+	void * data;  // pointer to the data
+	void * data_end; // data size
+};
+#endif
+
 #endif /* _UAPI__LINUX_BPF_H__ */

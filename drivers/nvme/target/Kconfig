@@ -76,6 +76,8 @@ config NVME_TARGET_TCP
 config NVME_TARGET_NDP
 	tristate "NVMe over Fabrics target NDP capability"
 	depends on NVME_TARGET
+	depends on BPF
+	depends on BPF_SYSCALL
 	help
 	  This enables NDP capability
 	
