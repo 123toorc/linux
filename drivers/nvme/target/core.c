@@ -41,6 +41,11 @@ u32 nvmet_ana_group_enabled[NVMET_MAX_ANAGRPS + 1];
 u64 nvmet_ana_chgcnt;
 DECLARE_RWSEM(nvmet_ana_sem);
 
+#ifdef CONFIG_NVME_TARGET_NDP_MODULE
+// TODO: make an arrry
+struct ndp_module nvmet_code_module;
+#endif
+
 inline u16 errno_to_nvme_status(struct nvmet_req *req, int errno)
 {
 	u16 status;
@@ -1485,6 +1490,10 @@ static int __init nvmet_init(void)
 	int error;
 
 	nvmet_ana_group_enabled[NVMET_DEFAULT_ANA_GRPID] = 1;
+
+#ifdef CONFIG_NVME_TARGET_NDP_MODULE
+	nvmet_code_module.loaded = false;
+#endif
 
 	buffered_io_wq = alloc_workqueue("nvmet-buffered-io-wq",
 			WQ_MEM_RECLAIM, 0);

@@ -323,6 +323,71 @@ static void nvmet_bdev_execute_write_zeroes(struct nvmet_req *req)
 	}
 }
 
+#ifdef CONFIG_NVME_TARGET_NDP_MODULE
+static void ndp_module_dl_volatile(struct nvmet_req *req, struct ndp_module *module) {
+	int sg_cnt = req->sg_cnt;
+	char *data;
+
+	if (!sg_cnt) {
+		// TODO: SC ERROR
+		nvmet_req_complete(req, 0);
+		return;
+	}
+
+	data = sg_virt(req->sg);
+	// TODO!: alloc and memcpy
+	module->loaded = true;
+	printk(data);
+	nvmet_req_complete(req, 0);
+}
+
+static void ndp_module_remove(struct nvmet_req *req, struct ndp_module *module) {
+	nvmet_code_module.loaded = false;
+	nvmet_req_complete(req, 0);
+}
+
+static void nvmet_bdev_execute_ndp_module_mgmt(struct nvmet_req *req)
+{
+	u32 cdw10 = le32_to_cpu(req->cmd->common.cdw10);
+	u32 cdw11 = le32_to_cpu(req->cmd->common.cdw11);
+	u8 eft = cdw11 & 0xFFFF;
+	u8 persist = (cdw11 >> 4) & 0xFF;
+	u8 shared = (cdw11 >> 6) & 0xFF;
+	u8 sub_cmd = (cdw11 >> 8) & 0xFFFF;
+	// TODO: add Privilege level
+
+	switch (sub_cmd) {
+	case 0:
+		// Download
+		if (persist) {
+			// TODO: persist
+			nvmet_req_complete(req, NVME_SC_INVALID_FIELD);
+			return;
+		} else {
+			if (nvmet_code_module.loaded) { // If available
+				nvmet_req_complete(req, NVME_SC_INVALID_FIELD);
+				return;
+			}
+
+			nvmet_code_module.eft = eft;
+			nvmet_code_module.persist = persist;
+			nvmet_code_module.shared = shared;
+			nvmet_code_module.code_len = cdw10;
+			nvmet_code_module.priv_level = 0;
+			ndp_module_dl_volatile(req, &nvmet_code_module);
+			return;
+		}
+	case 1:
+		// Remove
+		ndp_module_remove(req, &nvmet_code_module);
+		return;
+	default:
+		nvmet_req_complete(req, NVME_SC_INVALID_FIELD);
+		return;
+	}
+}
+#endif
+
 u16 nvmet_bdev_parse_io_cmd(struct nvmet_req *req)
 {
 	struct nvme_command *cmd = req->cmd;
@@ -341,6 +406,11 @@ u16 nvmet_bdev_parse_io_cmd(struct nvmet_req *req)
 	case nvme_cmd_write_zeroes:
 		req->execute = nvmet_bdev_execute_write_zeroes;
 		return 0;
+#ifdef CONFIG_NVME_TARGET_NDP_MODULE
+	case nvme_cmd_ndp_module_mgmt:
+		req->execute = nvmet_bdev_execute_ndp_module_mgmt;
+		return 0;
+#endif
 	default:
 		pr_err("unhandled cmd %d on qid %d\n", cmd->common.opcode,
 		       req->sq->qid);

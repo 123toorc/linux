@@ -519,4 +519,30 @@ static inline __le16 to0based(u32 a)
 	return cpu_to_le16(max(1U, min(1U << 16, a)) - 1);
 }
 
+#ifdef CONFIG_NVME_TARGET_NDP_MODULE
+// HACK: bookmark
+// void nvmet_execute_download_ndpm(struct nvmet_req *req);
+// void nvmet_execute_activate_ndpm(struct nvmet_req *req);
+
+extern struct ndp_module nvmet_code_module;
+
+enum nvmet_ndp_module_eft {
+	NVMET_NDP_MODULE_EBPF		= 0x01,
+};
+
+struct ndp_module {
+	bool loaded;
+	u8 eft;
+	bool persist;
+	bool shared;
+	int priv_level;
+	// Code of loaded module
+	u32 code_len;
+	void *module;
+};
+
+void nvmet_file_execute_ndp_module_mgmt(struct nvmet_req *req);
+// void nvmet_file_execute_ndp_copy(struct nvmet_req *req);
+#endif
+
 #endif /* _NVMET_H */

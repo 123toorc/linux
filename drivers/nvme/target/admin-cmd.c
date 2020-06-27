@@ -456,6 +456,13 @@ static void nvmet_execute_identify_ctrl(struct nvmet_req *req)
 
 	id->nwpc = 1 << 0; /* write protect and no write protect */
 
+#ifdef CONFIG_NVME_TARGET_NDP
+	// TODO: find better bytes
+
+	// Advertise NDP capability
+	id->vs[0] = 1;
+#endif 
+
 	status = nvmet_copy_to_sgl(req, 0, id, sizeof(*id));
 
 	kfree(id);
@@ -911,6 +918,16 @@ void nvmet_execute_keep_alive(struct nvmet_req *req)
 	nvmet_req_complete(req, 0);
 }
 
+// #ifdef CONFIG_NVME_TARGET_NDP
+// // HACK: bookmark
+// void nvmet_execute_download_ndpm(struct nvmet_req *req)
+// {
+// 	u16 status = 0;
+// 	nvmet_set_result(req, 0xBEEF);
+// 	nvmet_req_complete(req, status);
+// }
+// #endif
+
 u16 nvmet_parse_admin_cmd(struct nvmet_req *req)
 {
 	struct nvme_command *cmd = req->cmd;
@@ -947,6 +964,11 @@ u16 nvmet_parse_admin_cmd(struct nvmet_req *req)
 	case nvme_admin_keep_alive:
 		req->execute = nvmet_execute_keep_alive;
 		return 0;
+// #ifdef CONFIG_NVME_TARGET_NDP_MODULE
+// 	case nvme_admin_download_ndpm:
+// 		req->execute = nvmet_execute_download_ndpm;
+// 		return 0;
+// #endif
 	}
 
 	pr_err("unhandled cmd %d on qid %d\n", cmd->common.opcode,

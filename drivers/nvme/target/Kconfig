@@ -72,3 +72,10 @@ config NVME_TARGET_TCP
 	  devices over TCP.
 
 	  If unsure, say N.
+
+config NVME_TARGET_NDP
+	tristate "NVMe over Fabrics target NDP capability"
+	depends on NVME_TARGET
+	help
+	  This enables NDP capability
+	
