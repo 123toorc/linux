@@ -14,7 +14,7 @@ int bpf_prog(void * ctx)
 	int index = 0;
 	long *value;
     
-    ctx[0] = 'A';
+    ctx[0] = 'K';
 
 	return 0;
 }
