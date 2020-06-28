@@ -20,6 +20,10 @@
 #include <linux/blkdev.h>
 #include <linux/radix-tree.h>
 
+#ifdef CONFIG_NVME_TARGET_NDP_MODULE
+#include <linux/filter.h>
+#endif
+
 #define NVMET_ASYNC_EVENTS		4
 #define NVMET_ERROR_LOG_SLOTS		128
 #define NVMET_NO_ERROR_LOC		((u16)-1)
@@ -65,16 +69,15 @@ enum nvmet_ndp_module_eft {
 	NVMET_NDP_MODULE_EBPF		= 0x01,
 };
 
+// TODO: probably don't need this, can move into namespace
 struct ndp_module {
 	bool loaded;
 	u8 eft;
 	bool persist;
 	bool shared;
 	int priv_level;
-	// Code of loaded module
 	
-	u32 code_len;
-	void *module;
+	struct sock_fprog prog;
 };
 #endif
 

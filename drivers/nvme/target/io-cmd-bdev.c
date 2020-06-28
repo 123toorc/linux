@@ -9,7 +9,6 @@
 #include "nvmet.h"
 
 #ifdef CONFIG_NVME_TARGET_NDP_MODULE
-#include <linux/filter.h>
 #include <linux/bpf.h>
 #endif
 
@@ -156,6 +155,10 @@ static void nvmet_bdev_execute_rw(struct nvmet_req *req)
 	sector_t sector;
 	int op, i;
 
+	struct sk_filter *filter;
+	void *data;
+	int res;
+
 	if (!nvmet_check_data_len(req, nvmet_rw_len(req)))
 		return;
 
@@ -191,6 +194,20 @@ static void nvmet_bdev_execute_rw(struct nvmet_req *req)
 	bio->bi_opf = op;
 
 	blk_start_plug(&plug);
+
+	printk("HACK: op: %d\n", op);
+	if (op & REQ_OP_WRITE) {
+		rcu_read_lock();
+		filter = rcu_dereference(req->ns->ns_filter);
+		if (filter) {
+			data = sg_virt(req->sg);
+			printk("HACK: getting sg directly.\n");
+			res = BPF_PROG_RUN(filter->prog, data);
+			printk("HACK: applying filter\n");
+		}
+		rcu_read_unlock();
+	}
+
 	for_each_sg(req->sg, sg, req->sg_cnt, i) {
 		while (bio_add_page(bio, sg_page(sg), sg->length, sg->offset)
 				!= sg->length) {
@@ -512,27 +529,36 @@ int ndp_attach_bpf(struct sock_fprog *fprog, struct nvmet_ns *ns) {
 }
 
 static void ndp_module_dl_volatile(struct nvmet_req *req, struct ndp_module *module) {
-	size_t code_len = module->code_len;
+	size_t code_len = module->prog.len;
 	int sg_cnt = req->sg_cnt;
 	int sg_len = req->sg->length;
 	void *data;
 
-	if (!sg_cnt || code_len > sg_len) {
-		// TODO: SC ERROR
-		nvmet_req_complete(req, 0);
+	if (!sg_cnt || code_len * sizeof(struct sock_filter) > sg_len) {
+		// not enough data
+		printk("not enough data\n");
+		nvmet_req_complete(req, NVME_SC_INVALID_FIELD);
 		return;
 	}
 
 	data = sg_virt(req->sg);
-	// TODO!: alloc and memcpy
-	module->module = vmalloc(code_len);
-	memcpy(module->module, data, code_len);
+	module->prog.filter = (struct sock_filter *)vmalloc(code_len);
+	memcpy(module->prog.filter, data, code_len * sizeof(struct sock_filter));
 	module->loaded = true;
+	if (ndp_attach_bpf(&(module->prog), req->ns)) {
+		// FIXME: free
+		printk("attach failed\n");
+		nvmet_req_complete(req, NVME_SC_INVALID_FIELD);
+		return;
+	}
 	nvmet_req_complete(req, 0);
 }
 
 static void ndp_module_remove(struct nvmet_req *req, struct ndp_module *module) {
 	nvmet_code_module.loaded = false;
+	if (nvmet_code_module.loaded) {
+		vfree(nvmet_code_module.prog.filter);
+	}
 	nvmet_req_complete(req, 0);
 }
 
@@ -551,10 +577,20 @@ static void nvmet_bdev_execute_ndp_module_mgmt(struct nvmet_req *req)
 		// Download
 		if (persist) {
 			// TODO: persist
+			printk("TODO: persist\n");
 			nvmet_req_complete(req, NVME_SC_INVALID_FIELD);
 			return;
 		} else {
-			if (nvmet_code_module.loaded) { // If available
+			if (nvmet_code_module.loaded) {
+				// module not available
+				printk("module already loaded\n");
+				nvmet_req_complete(req, NVME_SC_INVALID_FIELD);
+				return;
+			}
+
+			if (cdw10 > U16_MAX) {
+				// filter blocks limit
+				printk("filter blocks limit\n");
 				nvmet_req_complete(req, NVME_SC_INVALID_FIELD);
 				return;
 			}
@@ -562,7 +598,7 @@ static void nvmet_bdev_execute_ndp_module_mgmt(struct nvmet_req *req)
 			nvmet_code_module.eft = eft;
 			nvmet_code_module.persist = persist;
 			nvmet_code_module.shared = shared;
-			nvmet_code_module.code_len = cdw10;
+			nvmet_code_module.prog.len = cdw10;
 			nvmet_code_module.priv_level = 0;
 			ndp_module_dl_volatile(req, &nvmet_code_module);
 			return;
