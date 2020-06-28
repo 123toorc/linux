@@ -557,7 +557,7 @@ static void ndp_module_dl_volatile(struct nvmet_req *req, struct ndp_module *mod
 
 	data = sg_virt(req->sg);
 	/* plain bpf_prog allocation */
-	prog = bpf_prog_alloc(bpf_prog_size(insn_cnt), GFP_USER);
+	prog = bpf_prog_alloc(bpf_prog_size(insn_cnt), 0);
 	if (!prog) {
 		nvmet_req_complete(req, NVME_SC_INVALID_FIELD);
 		return 0;
