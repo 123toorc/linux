@@ -520,8 +520,6 @@ static int __ns_attach_prog(struct bpf_prog *prog, struct nvmet_ns *ns)
 
 int ndp_attach_bpf(struct bpf_prog *prog, struct nvmet_ns *ns) {
 	int err;
-	if (err < 0)
-		return err;
 
 	printk("attaching prog\n");
 	err = __ns_attach_prog(prog, ns);
@@ -540,6 +538,7 @@ static void ndp_module_dl_volatile(struct nvmet_req *req, struct ndp_module *mod
 	struct bpf_prog *prog;
 	void *data;
 	int err;
+	u32 ufd;
 	unsigned short i;
 
 	if (insn_cnt > U16_MAX) {
@@ -557,32 +556,113 @@ static void ndp_module_dl_volatile(struct nvmet_req *req, struct ndp_module *mod
 	}
 
 	data = sg_virt(req->sg);
-
-	prog = bpf_prog_alloc(insn_cnt, 0);
+	/* plain bpf_prog allocation */
+	prog = bpf_prog_alloc(bpf_prog_size(insn_cnt), GFP_USER);
 	if (!prog) {
-		// out of mem
 		nvmet_req_complete(req, NVME_SC_INVALID_FIELD);
-		return;
+		return 0;
 	}
 
 	prog->expected_attach_type = 0;
+	prog->aux->attach_btf_id = 0;
+	prog->aux->offload_requested = false;
+
+	err = security_bpf_prog_alloc(prog->aux);
+	if (err)
+		goto free_prog_nouncharge;
+
+	// err = bpf_prog_charge_memlock(prog);
+	// if (err)
+	// 	goto free_prog_sec;
+
 	prog->len = insn_cnt;
-	memcpy(prog->insns, data, insn_cnt * sizeof(struct bpf_insn));
+
+	err = -EFAULT;
+	memcpy(prog->insns, data, bpf_prog_insn_size(prog));
+
 	prog->orig_prog = NULL;
 	prog->jited = 0;
+
+	atomic64_set(&prog->aux->refcnt, 1);
 	prog->gpl_compatible = 1; // TODO: ?
 
-	// TODO: run eBPF verifier
-	prog = bpf_prog_select_runtime(prog, &err);
-	module->loaded = true;
+	// /* find program type: socket_filter vs tracing_filter */
+	// err = find_prog_type(BPF_PROG_TYPE_NVME_NDP, prog);
+	// if (err < 0)
+	// 	goto free_prog;
+	prog->type = BPF_PROG_TYPE_NVME_NDP;
 
-	if (ndp_attach_bpf(module->bpf, req->ns)) {
-		// FIXME: free
-		printk("attach failed\n");
+	prog->aux->load_time = ktime_get_boottime_ns();
+	err = bpf_obj_name_cpy(prog->aux->name, "NVME_NDP", 9);
+	if (err < 0)
+		goto free_prog;
+
+	// TODO: how? /* run eBPF verifier */
+	// err = bpf_check(&prog, attr, uattr);
+	// if (err < 0)
+	// 	goto free_used_maps;
+
+	prog = bpf_prog_select_runtime(prog, &err);
+	if (err < 0)
+		goto free_used_maps;
+
+	// err = bpf_prog_alloc_id(prog);
+	// if (err)
+	// 	goto free_used_maps;
+
+	/* Upon success of bpf_prog_alloc_id(), the BPF prog is
+	 * effectively publicly exposed. However, retrieving via
+	 * bpf_prog_get_fd_by_id() will take another reference,
+	 * therefore it cannot be gone underneath us.
+	 *
+	 * Only for the time /after/ successful bpf_prog_new_fd()
+	 * and before returning to userspace, we might just hold
+	 * one reference and any parallel close on that fd could
+	 * rip everything out. Hence, below notifications must
+	 * happen before bpf_prog_new_fd().
+	 *
+	 * Also, any failure handling from this point onwards must
+	 * be using bpf_prog_put() given the program is exposed.
+	 */
+	// bpf_prog_kallsyms_add(prog);
+	// perf_event_bpf_event(prog, PERF_BPF_EVENT_PROG_LOAD, 0);
+	// bpf_audit_prog(prog, BPF_AUDIT_LOAD);
+
+	err = bpf_prog_new_fd(prog);
+	if (err < 0) {
+		bpf_prog_put(prog);
 		nvmet_req_complete(req, NVME_SC_INVALID_FIELD);
 		return;
 	}
+
+	module->loaded = true;
+
+	// if (ndp_attach_bpf(module->bpf, req->ns)) {
+	// 	// FIXME: free
+	// 	printk("attach failed\n");
+	// 	nvmet_req_complete(req, NVME_SC_INVALID_FIELD);
+	// 	return;
+	// }
 	nvmet_req_complete(req, 0);
+	return;
+
+	
+free_used_maps:
+	/* In case we have subprogs, we need to wait for a grace
+	 * period before we can tear down JIT memory since symbols
+	 * are already exposed under kallsyms.
+	 */
+	// __bpf_prog_put_noref(prog, prog->aux->func_cnt);
+	nvmet_req_complete(req, 0);
+	return err;
+free_prog:
+	// bpf_prog_uncharge_memlock(prog);
+free_prog_sec:
+	security_bpf_prog_free(prog->aux);
+free_prog_nouncharge:
+	bpf_prog_free(prog);
+	nvmet_req_complete(req, 0);
+	return err;
 }
 
 static void ndp_module_remove(struct nvmet_req *req, struct ndp_module *module) {
