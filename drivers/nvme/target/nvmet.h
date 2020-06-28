@@ -76,8 +76,8 @@ struct ndp_module {
 	bool persist;
 	bool shared;
 	int priv_level;
-	
-	struct sock_fprog_kern prog;
+
+	struct bpf_prog *bpf;
 };
 #endif
 

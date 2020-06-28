@@ -518,35 +518,14 @@ static int __ns_attach_prog(struct bpf_prog *prog, struct nvmet_ns *ns)
 	return 0;
 }
 
-int ndp_attach_bpf(struct sock_fprog_kern *fprog, struct nvmet_ns *ns) {
-	struct bpf_prog *prog;
-	int err, i;
-
-	printk("create bpf prog\n");
-
-	printk("2 prog_len: %d\n",  fprog->len);
-	for (i = 0; i < fprog->len; ++i) {
-		printk("2 instr: %04X %02X %02X %08X\n", 
-			fprog->filter[i].code,
-			fprog->filter[i].jt,
-			fprog->filter[i].jf,
-			fprog->filter[i].k
-		);
-	}
-
-	err = bpf_prog_create(&prog, fprog);
-
-	printk("create bpf prog error: %d\n", err);
-
+int ndp_attach_bpf(struct bpf_prog *prog, struct nvmet_ns *ns) {
+	int err;
 	if (err < 0)
 		return err;
-
-	printk("prog type %d\n", prog->type);
 
 	printk("attaching prog\n");
 	err = __ns_attach_prog(prog, ns);
 	if (err < 0) {
-		__bpf_prog_release(prog);
 		return err;
 	}
 
@@ -554,13 +533,23 @@ int ndp_attach_bpf(struct sock_fprog_kern *fprog, struct nvmet_ns *ns) {
 }
 
 static void ndp_module_dl_volatile(struct nvmet_req *req, struct ndp_module *module) {
-	unsigned short code_len = module->prog.len;
+	u32 code_len = le32_to_cpu(req->cmd->common.cdw10);
 	int sg_cnt = req->sg_cnt;
 	int sg_len = req->sg->length;
+	int insn_cnt = code_len / sizeof(struct bpf_insn);
+	struct bpf_prog *prog;
 	void *data;
+	int err;
 	unsigned short i;
 
-	if (!sg_cnt || code_len * sizeof(struct sock_filter) > sg_len) {
+	if (insn_cnt > U16_MAX) {
+		// filter blocks limit
+		printk("bpf blocks limit\n");
+		nvmet_req_complete(req, NVME_SC_INVALID_FIELD);
+		return;
+	}
+			
+	if (!sg_cnt || code_len > sg_len) {
 		// not enough data
 		printk("not enough data\n");
 		nvmet_req_complete(req, NVME_SC_INVALID_FIELD);
@@ -568,22 +557,26 @@ static void ndp_module_dl_volatile(struct nvmet_req *req, struct ndp_module *mod
 	}
 
 	data = sg_virt(req->sg);
-	module->prog.filter = (struct sock_filter *)vmalloc(code_len * sizeof(struct sock_filter));
-	memcpy(module->prog.filter, data, code_len * sizeof(struct sock_filter));
-	module->prog.len = code_len;
 
-	printk("prog_len: %d\n",  module->prog.len);
-	for (i = 0; i < code_len; ++i) {
-		printk("instr: %04X %02X %02X %08X\n", 
-			module->prog.filter[i].code,
-			module->prog.filter[i].jt,
-			module->prog.filter[i].jf,
-			module->prog.filter[i].k
-		);
+	prog = bpf_prog_alloc(insn_cnt, 0);
+	if (!prog) {
+		// out of mem
+		nvmet_req_complete(req, NVME_SC_INVALID_FIELD);
+		return;
 	}
 
+	prog->expected_attach_type = 0;
+	prog->len = insn_cnt;
+	memcpy(prog->insns, data, insn_cnt * sizeof(struct bpf_insn));
+	prog->orig_prog = NULL;
+	prog->jited = 0;
+	prog->gpl_compatible = 1; // TODO: ?
+
+	// TODO: run eBPF verifier
+	prog = bpf_prog_select_runtime(prog, &err);
 	module->loaded = true;
-	if (ndp_attach_bpf(&(module->prog), req->ns)) {
+
+	if (ndp_attach_bpf(module->bpf, req->ns)) {
 		// FIXME: free
 		printk("attach failed\n");
 		nvmet_req_complete(req, NVME_SC_INVALID_FIELD);
@@ -594,15 +587,11 @@ static void ndp_module_dl_volatile(struct nvmet_req *req, struct ndp_module *mod
 
 static void ndp_module_remove(struct nvmet_req *req, struct ndp_module *module) {
 	nvmet_code_module.loaded = false;
-	if (nvmet_code_module.loaded) {
-		vfree(nvmet_code_module.prog.filter);
-	}
 	nvmet_req_complete(req, 0);
 }
 
 static void nvmet_bdev_execute_ndp_module_mgmt(struct nvmet_req *req)
 {
-	u32 cdw10 = le32_to_cpu(req->cmd->common.cdw10);
 	u32 cdw11 = le32_to_cpu(req->cmd->common.cdw11);
 	u8 eft = cdw11 & 0xFFFF;
 	u8 persist = (cdw11 >> 4) & 0xFF;
@@ -626,17 +615,9 @@ static void nvmet_bdev_execute_ndp_module_mgmt(struct nvmet_req *req)
 				return;
 			}
 
-			if (cdw10 > U16_MAX) {
-				// filter blocks limit
-				printk("filter blocks limit\n");
-				nvmet_req_complete(req, NVME_SC_INVALID_FIELD);
-				return;
-			}
-
 			nvmet_code_module.eft = eft;
 			nvmet_code_module.persist = persist;
 			nvmet_code_module.shared = shared;
-			nvmet_code_module.prog.len = cdw10;
 			nvmet_code_module.priv_level = 0;
 			ndp_module_dl_volatile(req, &nvmet_code_module);
 			return;
