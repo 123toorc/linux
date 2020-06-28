@@ -391,20 +391,25 @@ struct bpf_prog *__get_filter(struct sock_fprog *fprog)
 	struct bpf_prog *prog;
 	int err;
 
+	printk("bpf_check\n");
 	if (!bpf_check_basics_ok(fprog->filter, fprog->len))
 		return ERR_PTR(-EINVAL);
 
+	printk("bpf_alloc\n");
 	prog = bpf_prog_alloc(bpf_prog_size(fprog->len), 0);
 	if (!prog)
 		return ERR_PTR(-ENOMEM);
-	
+
+	printk("bpf_copy\n");
 	if (copy_from_user(prog->insns, fprog->filter, fsize)) {
 		bpf_prog_free(prog);
 		return ERR_PTR(-EFAULT);
 	}
 
+	printk("bpf_setlen\n");
 	prog->len = fprog->len;
 
+	printk("bpf_prog_store_orig_filter\n");
 	err = bpf_prog_store_orig_filter(prog, fprog);
 
 	if (err) {
@@ -412,6 +417,7 @@ struct bpf_prog *__get_filter(struct sock_fprog *fprog)
 		return ERR_PTR(-ENOMEM);
 	}
 
+	printk("bpf_prepare_filter\n");
 	return bpf_prepare_filter(prog, NULL);
 }
 
@@ -512,13 +518,32 @@ static int __ns_attach_prog(struct bpf_prog *prog, struct nvmet_ns *ns)
 	return 0;
 }
 
-int ndp_attach_bpf(struct sock_fprog *fprog, struct nvmet_ns *ns) {
-	struct bpf_prog *prog = __get_filter(fprog);
-	int err;
+int ndp_attach_bpf(struct sock_fprog_kern *fprog, struct nvmet_ns *ns) {
+	struct bpf_prog *prog;
+	int err, i;
 
-	if (IS_ERR(prog))
-		return PTR_ERR(prog);
+	printk("create bpf prog\n");
 
+	printk("2 prog_len: %d\n",  fprog->len);
+	for (i = 0; i < fprog->len; ++i) {
+		printk("2 instr: %04X %02X %02X %08X\n", 
+			fprog->filter[i].code,
+			fprog->filter[i].jt,
+			fprog->filter[i].jf,
+			fprog->filter[i].k
+		);
+	}
+
+	err = bpf_prog_create(&prog, fprog);
+
+	printk("create bpf prog error: %d\n", err);
+
+	if (err < 0)
+		return err;
+
+	printk("prog type %d\n", prog->type);
+
+	printk("attaching prog\n");
 	err = __ns_attach_prog(prog, ns);
 	if (err < 0) {
 		__bpf_prog_release(prog);
@@ -529,10 +554,11 @@ int ndp_attach_bpf(struct sock_fprog *fprog, struct nvmet_ns *ns) {
 }
 
 static void ndp_module_dl_volatile(struct nvmet_req *req, struct ndp_module *module) {
-	size_t code_len = module->prog.len;
+	unsigned short code_len = module->prog.len;
 	int sg_cnt = req->sg_cnt;
 	int sg_len = req->sg->length;
 	void *data;
+	unsigned short i;
 
 	if (!sg_cnt || code_len * sizeof(struct sock_filter) > sg_len) {
 		// not enough data
@@ -542,8 +568,20 @@ static void ndp_module_dl_volatile(struct nvmet_req *req, struct ndp_module *mod
 	}
 
 	data = sg_virt(req->sg);
-	module->prog.filter = (struct sock_filter *)vmalloc(code_len);
+	module->prog.filter = (struct sock_filter *)vmalloc(code_len * sizeof(struct sock_filter));
 	memcpy(module->prog.filter, data, code_len * sizeof(struct sock_filter));
+	module->prog.len = code_len;
+
+	printk("prog_len: %d\n",  module->prog.len);
+	for (i = 0; i < code_len; ++i) {
+		printk("instr: %04X %02X %02X %08X\n", 
+			module->prog.filter[i].code,
+			module->prog.filter[i].jt,
+			module->prog.filter[i].jf,
+			module->prog.filter[i].k
+		);
+	}
+
 	module->loaded = true;
 	if (ndp_attach_bpf(&(module->prog), req->ns)) {
 		// FIXME: free
