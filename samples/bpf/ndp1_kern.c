@@ -9,12 +9,15 @@
 // };
 
 SEC("ndp1")
-int bpf_prog(void * ctx)
+int bpf_prog(struct nvme_ndp_data *ctx)
 {
-	int index = 0;
-	long *value;
-    
-    ctx[0] = 'K';
+	int i = 0;
+	char *in = ctx->in_data;
+	char *out = ctx->out_data;
+
+	for (int i = 0; i < 1024; i++) {
+		out[i] = 'K';
+	}
 
 	return 0;
 }

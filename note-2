@@ -7,5 +7,7 @@ sudo nvme io-passthru /dev/nvme0 -n 1 -o 0x21 -4 6764 -5 0 -l 6764 -i large.txt 
 # remove
 sudo nvme io-passthru /dev/nvme0 -n 1 -o 0x21 -5 256
 
-# large test
-sudo nvme io-passthru /dev/nvme0 -n 1 -o 0x21 -4 6764 -5 0 -l 6764 -i large.txt -w
+# ndp_output
+sudo nvme io-passthru /dev/nvme0 -n 1 -o 0x21 -4 8224 -5 0 -l 8224 -i ndp_output -w
+
+sudo nvme write /dev/nvme0n1 -s 0 -z 6764 -d large.txt

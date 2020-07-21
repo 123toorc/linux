@@ -204,7 +204,9 @@ static void nvmet_bdev_execute_rw(struct nvmet_req *req)
 
 		ctx.op = op & REQ_OP_WRITE;
 		ctx.in_data = vmalloc(sgl_len);
+		sg_copy_to_buffer(req->sg, req->sg_cnt, ctx.in_data, sgl_len);
 		ctx.in_data_len = sgl_len;
+
 		ctx.out_data = vzalloc(blk_len);
 		ctx.out_data_len = blk_len;
 
