@@ -1,0 +1,10 @@
+sudo mkdir -p /mnt/kernel
+sudo mount -t 9p -o trans=virtio -oversion=9p2000.L kernel /mnt/kernel
+
+cp -rf /mnt/kernel/samples/bpf ~/linux/samples/bpf
+cd ~/linux/samples/bpf
+make
+
+objcopy -O binary -I elf32-little --only-section=ndp1 ndp1_kern.o ~/ndp_output
+
+cd ~

@@ -1,0 +1,11 @@
+sudo modprobe nvme-tcp
+sudo nvme connect -t tcp -a 192.168.0.101 -s 4420 -n nvmet-export
+
+# large test
+sudo nvme io-passthru /dev/nvme0 -n 1 -o 0x21 -4 6764 -5 0 -l 6764 -i large.txt -w
+
+# remove
+sudo nvme io-passthru /dev/nvme0 -n 1 -o 0x21 -5 256
+
+# large test
+sudo nvme io-passthru /dev/nvme0 -n 1 -o 0x21 -4 6764 -5 0 -l 6764 -i large.txt -w

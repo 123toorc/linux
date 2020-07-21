@@ -79,8 +79,6 @@ BPF_PROG_TYPE(BPF_PROG_TYPE_LSM, lsm,
 #ifdef CONFIG_NVME_TARGET_NDP_MODULE
 BPF_PROG_TYPE(BPF_PROG_TYPE_NVME_NDP, nvme_ndp,
 	      void *, void *)
-// BPF_PROG_TYPE(BPF_PROG_TYPE_NVME_NDP, nvme_ndp,
-// 		struct __nvme_ndp_buff, struct nvme_ndp_kern)
 #endif
 
 BPF_MAP_TYPE(BPF_MAP_TYPE_ARRAY, array_map_ops)

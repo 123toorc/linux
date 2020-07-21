@@ -601,7 +601,8 @@ enum nvme_opcode {
 	nvme_cmd_resv_release	= 0x15,
 #ifdef CONFIG_NVME_TARGET_NDP_MODULE
 	nvme_cmd_ndp_module_mgmt	= 0x21,
-	nvme_cmd_ndp_copy 			= 0x22,
+	nvme_cmd_ndp_write			= 0x22,
+	nvme_cmd_ndp_read			= 0x23,
 #endif
 };
 

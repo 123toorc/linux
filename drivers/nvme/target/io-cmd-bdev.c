@@ -155,12 +155,17 @@ static void nvmet_bdev_execute_rw(struct nvmet_req *req)
 	sector_t sector;
 	int op, i;
 
-	struct sk_filter *filter;
-	void *data;
+#ifdef CONFIG_NVME_TARGET_NDP_MODULE
+	struct bpf_prog *prog;
+	struct nvme_ndp_data ctx;
 	int res;
 
+	size_t sgl_len = req->transfer_len;
+	u32 blk_len = nvmet_rw_len(req);
+#else
 	if (!nvmet_check_data_len(req, nvmet_rw_len(req)))
 		return;
+#endif
 
 	if (!req->sg_cnt) {
 		nvmet_req_complete(req, 0);
@@ -193,20 +198,26 @@ static void nvmet_bdev_execute_rw(struct nvmet_req *req)
 	bio->bi_end_io = nvmet_bio_done;
 	bio->bi_opf = op;
 
-	blk_start_plug(&plug);
+#ifdef CONFIG_NVME_TARGET_NDP_MODULE
+	if (req->ns->ndpm) {
+		prog = req->ns->ndpm->prog;
 
-	printk("HACK: op: %d\n", op);
-	if (op & REQ_OP_WRITE) {
-		rcu_read_lock();
-		filter = rcu_dereference(req->ns->ns_filter);
-		if (filter) {
-			data = sg_virt(req->sg);
-			printk("HACK: getting sg directly.\n");
-			res = BPF_PROG_RUN(filter->prog, data);
-			printk("HACK: applying filter\n");
-		}
-		rcu_read_unlock();
+		ctx.op = op & REQ_OP_WRITE;
+		ctx.in_data = vmalloc(sgl_len);
+		ctx.in_data_len = sgl_len;
+		ctx.out_data = vzalloc(blk_len);
+		ctx.out_data_len = blk_len;
+
+		// TODO: create SGL for out_data
+
+		res = BPF_PROG_RUN(prog, &ctx);
+		printk("HACK: applying ebpf, res: %d\n", res);
+		printk("HACK: in_data: %s\n", (char *)ctx.in_data);
+		printk("HACK: out_data: %s\n", (char *)ctx.out_data);
 	}
+#endif
+
+	blk_start_plug(&plug);
 
 	for_each_sg(req->sg, sg, req->sg_cnt, i) {
 		while (bio_add_page(bio, sg_page(sg), sg->length, sg->offset)
@@ -348,326 +359,99 @@ static void nvmet_bdev_execute_write_zeroes(struct nvmet_req *req)
 #ifdef CONFIG_NVME_TARGET_NDP_MODULE
 
 // ==================
-//        BPF
+//      NDP eBPF
 // ==================
-static bool bpf_check_basics_ok(const struct sock_filter *filter,
-				unsigned int flen)
-{
-	if (filter == NULL)
-		return false;
-	if (flen == 0 || flen > BPF_MAXINSNS)
-		return false;
-
-	return true;
-}
-
-static int bpf_prog_store_orig_filter(struct bpf_prog *fp,
-				      const struct sock_fprog *fprog)
-{
-	unsigned int fsize = bpf_classic_proglen(fprog);
-	struct sock_fprog_kern *fkprog;
-
-	fp->orig_prog = kmalloc(sizeof(*fkprog), GFP_KERNEL);
-	if (!fp->orig_prog)
-		return -ENOMEM;
-
-	fkprog = fp->orig_prog;
-	fkprog->len = fprog->len;
-
-	fkprog->filter = kmemdup(fp->insns, fsize,
-				 GFP_KERNEL | __GFP_NOWARN);
-	if (!fkprog->filter) {
-		kfree(fp->orig_prog);
-		return -ENOMEM;
-	}
-
-	return 0;
-}
-
-static
-struct bpf_prog *__get_filter(struct sock_fprog *fprog)
-{
-	unsigned int fsize = bpf_classic_proglen(fprog);
-	struct bpf_prog *prog;
-	int err;
-
-	printk("bpf_check\n");
-	if (!bpf_check_basics_ok(fprog->filter, fprog->len))
-		return ERR_PTR(-EINVAL);
-
-	printk("bpf_alloc\n");
-	prog = bpf_prog_alloc(bpf_prog_size(fprog->len), 0);
-	if (!prog)
-		return ERR_PTR(-ENOMEM);
-
-	printk("bpf_copy\n");
-	if (copy_from_user(prog->insns, fprog->filter, fsize)) {
-		bpf_prog_free(prog);
-		return ERR_PTR(-EFAULT);
-	}
-
-	printk("bpf_setlen\n");
-	prog->len = fprog->len;
-
-	printk("bpf_prog_store_orig_filter\n");
-	err = bpf_prog_store_orig_filter(prog, fprog);
-
-	if (err) {
-		bpf_prog_free(prog);
-		return ERR_PTR(-ENOMEM);
-	}
-
-	printk("bpf_prepare_filter\n");
-	return bpf_prepare_filter(prog, NULL);
-}
-
-extern int sysctl_optmem_max;
-
-static bool __ns_filter_charge(struct nvmet_ns *ns, struct sk_filter *fp)
-{
-	u32 filter_size = bpf_prog_size(fp->prog->len);
-
-	if (filter_size <= sysctl_optmem_max &&
-	    atomic_read(&ns->ns_omem_alloc) + filter_size < sysctl_optmem_max) {
-		atomic_add(filter_size, &ns->ns_omem_alloc);
-		return true;
-	}
-	return false;
-}
-
-static void bpf_release_orig_filter(struct bpf_prog *fp)
-{
-	struct sock_fprog_kern *fprog = fp->orig_prog;
-
-	if (fprog) {
-		kfree(fprog->filter);
-		kfree(fprog);
+static void __ndp_module_free(struct nvmet_ns *ns) {
+	if (ns->ndpm) {
+		if (ns->ndpm->prog) {
+			if (ns->ndpm->prog->aux) {
+				free_percpu(ns->ndpm->prog->aux->stats);
+				kfree(ns->ndpm->prog->aux->poke_tab);
+				kfree(ns->ndpm->prog->aux);
+			}
+			vfree(ns->ndpm->prog);
+		}
+		kfree(ns->ndpm);
+		ns->ndpm = NULL;
 	}
 }
 
-static void __bpf_prog_release(struct bpf_prog *prog)
-{
-	if (prog->type == BPF_PROG_TYPE_NVME_NDP) {
-		bpf_prog_put(prog);
-	} else {
-		bpf_release_orig_filter(prog);
-		bpf_prog_free(prog);
-	}
+static void __ndp_module_attach_alloc(struct nvmet_ns *ns) {
+	ns->ndpm = kzalloc(sizeof(struct ndp_module), GFP_KERNEL);
 }
 
-static void __ns_filter_release(struct sk_filter *fp)
-{
-	__bpf_prog_release(fp->prog);
-	kfree(fp);
+static void ndp_module_remove(struct nvmet_req *req) {
+	__ndp_module_free(req->ns);
+	nvmet_req_complete(req, 0);
 }
 
-/**
- * 	sk_filter_release_rcu - Release a socket filter by rcu_head
- *	@rcu: rcu_head that contains the sk_filter to free
- */
-static void ns_filter_release_rcu(struct rcu_head *rcu)
-{
-	struct sk_filter *fp = container_of(rcu, struct sk_filter, rcu);
-
-	__ns_filter_release(fp);
-}
-
-/**
- *	sk_filter_release - release a socket filter
- *	@fp: filter to remove
- *
- *	Remove a filter from a socket and release its resources.
- */
-static void ns_filter_release(struct sk_filter *fp)
-{
-	if (refcount_dec_and_test(&fp->refcnt))
-		call_rcu(&fp->rcu, ns_filter_release_rcu);
-}
-
-static void ns_filter_uncharge(struct nvmet_ns *ns, struct sk_filter *fp)
-{
-	u32 filter_size = bpf_prog_size(fp->prog->len);
-
-	atomic_sub(filter_size, &ns->ns_omem_alloc);
-	ns_filter_release(fp);
-}
-
-static int __ns_attach_prog(struct bpf_prog *prog, struct nvmet_ns *ns)
-{
-	struct sk_filter *fp, *old_fp;
-
-	fp = kmalloc(sizeof(*fp), GFP_KERNEL);
-	if (!fp)
-		return -ENOMEM;
-
-	fp->prog = prog;
-
-	if (!__ns_filter_charge(ns, fp)) {
-		kfree(fp);
-		return -ENOMEM;
-	}
-	refcount_set(&fp->refcnt, 1);
-
-	old_fp = rcu_dereference_protected(ns->ns_filter,
-					   lockdep_sock_is_held(ns));
-	rcu_assign_pointer(ns->ns_filter, fp);
-
-	if (old_fp)
-		ns_filter_uncharge(ns, old_fp);
-
-	return 0;
-}
-
-int ndp_attach_bpf(struct bpf_prog *prog, struct nvmet_ns *ns) {
-	int err;
-
-	printk("attaching prog\n");
-	err = __ns_attach_prog(prog, ns);
-	if (err < 0) {
-		return err;
-	}
-
-	return err;
-}
-
-static void ndp_module_dl_volatile(struct nvmet_req *req, struct ndp_module *module) {
-	u32 code_len = le32_to_cpu(req->cmd->common.cdw10);
-	int sg_cnt = req->sg_cnt;
-	int sg_len = req->sg->length;
+static void ndp_module_dl_volatile(struct nvmet_req *req) {
+	u32 cdw10 = le32_to_cpu(req->cmd->common.cdw10);
+	u32 code_len = cdw10;
 	int insn_cnt = code_len / sizeof(struct bpf_insn);
-	struct bpf_prog *prog;
-	void *data;
-	int err;
-	u32 ufd;
-	unsigned short i;
+	struct bpf_prog *fp;
+	int err = 0, i = 0;
 
 	if (insn_cnt > U16_MAX) {
-		// filter blocks limit
-		printk("bpf blocks limit\n");
-		nvmet_req_complete(req, NVME_SC_INVALID_FIELD);
-		return;
-	}
-			
-	if (!sg_cnt || code_len > sg_len) {
-		// not enough data
-		printk("not enough data\n");
+		// instruction limit
+		printk("ebpf too many instructions\n");
 		nvmet_req_complete(req, NVME_SC_INVALID_FIELD);
 		return;
 	}
 
-	data = sg_virt(req->sg);
-	/* plain bpf_prog allocation */
-	prog = bpf_prog_alloc(bpf_prog_size(insn_cnt), 0);
-	if (!prog) {
-		nvmet_req_complete(req, NVME_SC_INVALID_FIELD);
-		return 0;
-	}
-
-	prog->expected_attach_type = 0;
-	prog->aux->attach_btf_id = 0;
-	prog->aux->offload_requested = false;
-
-	err = security_bpf_prog_alloc(prog->aux);
-	if (err)
-		goto free_prog_nouncharge;
-
-	// err = bpf_prog_charge_memlock(prog);
-	// if (err)
-	// 	goto free_prog_sec;
-
-	prog->len = insn_cnt;
-
-	err = -EFAULT;
-	memcpy(prog->insns, data, bpf_prog_insn_size(prog));
-
-	prog->orig_prog = NULL;
-	prog->jited = 0;
-
-	atomic64_set(&prog->aux->refcnt, 1);
-	prog->gpl_compatible = 1; // TODO: ?
-
-	// /* find program type: socket_filter vs tracing_filter */
-	// err = find_prog_type(BPF_PROG_TYPE_NVME_NDP, prog);
-	// if (err < 0)
-	// 	goto free_prog;
-	prog->type = BPF_PROG_TYPE_NVME_NDP;
-
-	prog->aux->load_time = ktime_get_boottime_ns();
-	err = bpf_obj_name_cpy(prog->aux->name, "NVME_NDP", 9);
-	if (err < 0)
-		goto free_prog;
-
-	// TODO: how? /* run eBPF verifier */
-	// err = bpf_check(&prog, attr, uattr);
-	// if (err < 0)
-	// 	goto free_used_maps;
-
-	prog = bpf_prog_select_runtime(prog, &err);
-	if (err < 0)
-		goto free_used_maps;
-
-	// err = bpf_prog_alloc_id(prog);
-	// if (err)
-	// 	goto free_used_maps;
-
-	/* Upon success of bpf_prog_alloc_id(), the BPF prog is
-	 * effectively publicly exposed. However, retrieving via
-	 * bpf_prog_get_fd_by_id() will take another reference,
-	 * therefore it cannot be gone underneath us.
-	 *
-	 * Only for the time /after/ successful bpf_prog_new_fd()
-	 * and before returning to userspace, we might just hold
-	 * one reference and any parallel close on that fd could
-	 * rip everything out. Hence, below notifications must
-	 * happen before bpf_prog_new_fd().
-	 *
-	 * Also, any failure handling from this point onwards must
-	 * be using bpf_prog_put() given the program is exposed.
-	 */
-	// bpf_prog_kallsyms_add(prog);
-	// perf_event_bpf_event(prog, PERF_BPF_EVENT_PROG_LOAD, 0);
-	// bpf_audit_prog(prog, BPF_AUDIT_LOAD);
-
-	err = bpf_prog_new_fd(prog);
-	if (err < 0) {
-		bpf_prog_put(prog);
+	fp = bpf_prog_alloc(bpf_prog_size(insn_cnt), 0);
+	if (!fp) {
+		ndp_module_remove(req);
+		// TODO: error code
 		nvmet_req_complete(req, NVME_SC_INVALID_FIELD);
 		return;
 	}
 
-	module->loaded = true;
+	fp->orig_prog = NULL;
 
-	// if (ndp_attach_bpf(module->bpf, req->ns)) {
-	// 	// FIXME: free
-	// 	printk("attach failed\n");
-	// 	nvmet_req_complete(req, NVME_SC_INVALID_FIELD);
-	// 	return;
+	fp->expected_attach_type = 0;
+	fp->aux->attach_btf_id = 0;
+
+	// 	return;	fp->aux->offload_requested = false;
+
+	// err = security_bpf_prog_alloc(fp->aux);
+	// if (err) {
+	// 	// TODO: free
+	// 	nvmet_req_comple
 	// }
+
+	if (sg_copy_to_buffer(req->sg, req->sg_cnt, fp->insnsi, code_len) != code_len) {
+		ndp_module_remove(req);
+		nvmet_req_complete(req, NVME_SC_SGL_INVALID_DATA | NVME_SC_DNR);
+		return;
+	}
+	
+	fp->len = insn_cnt;
+
+	fp->orig_prog = NULL;
+	fp->jited = 0;
+
+	atomic64_set(&fp->aux->refcnt, 1);
+	fp->gpl_compatible = 1; // TODO: ?
+
+	fp->type = BPF_PROG_TYPE_NVME_NDP;
+	fp->aux->load_time = ktime_get_boottime_ns();
+	memcpy(fp->aux->name, "NVME_NDP", 9);
+
+	printk("ebpf proglen: %d\n", fp->len);
+
+	fp = bpf_prog_select_runtime(fp, &err);
+	if (err) {
+		printk("jit failed");
+		ndp_module_remove(req);
+		nvmet_req_complete(req, NVME_SC_INVALID_FIELD);
+		return;
+	}
+
+	req->ns->ndpm->prog = fp;
 	nvmet_req_complete(req, 0);
 	return;
 
-	
-free_used_maps:
-	/* In case we have subprogs, we need to wait for a grace
-	 * period before we can tear down JIT memory since symbols
-	 * are already exposed under kallsyms.
-	 */
-	// __bpf_prog_put_noref(prog, prog->aux->func_cnt);
-	nvmet_req_complete(req, 0);
-	return err;
-free_prog:
-	// bpf_prog_uncharge_memlock(prog);
-free_prog_sec:
-	security_bpf_prog_free(prog->aux);
-free_prog_nouncharge:
-	bpf_prog_free(prog);
-	nvmet_req_complete(req, 0);
-	return err;
-}
-
-static void ndp_module_remove(struct nvmet_req *req, struct ndp_module *module) {
-	nvmet_code_module.loaded = false;
-	nvmet_req_complete(req, 0);
 }
 
 static void nvmet_bdev_execute_ndp_module_mgmt(struct nvmet_req *req)
@@ -677,40 +461,41 @@ static void nvmet_bdev_execute_ndp_module_mgmt(struct nvmet_req *req)
 	u8 persist = (cdw11 >> 4) & 0xFF;
 	u8 shared = (cdw11 >> 6) & 0xFF;
 	u8 sub_cmd = (cdw11 >> 8) & 0xFFFF;
-	// TODO: add Privilege level
 
 	switch (sub_cmd) {
 	case 0:
 		// Download
 		if (persist) {
 			// TODO: persist
-			printk("TODO: persist\n");
 			nvmet_req_complete(req, NVME_SC_INVALID_FIELD);
 			return;
 		} else {
-			if (nvmet_code_module.loaded) {
+			if (req->ns->ndpm) {
 				// module not available
 				printk("module already loaded\n");
 				nvmet_req_complete(req, NVME_SC_INVALID_FIELD);
 				return;
 			}
 
-			nvmet_code_module.eft = eft;
-			nvmet_code_module.persist = persist;
-			nvmet_code_module.shared = shared;
-			nvmet_code_module.priv_level = 0;
-			ndp_module_dl_volatile(req, &nvmet_code_module);
+			__ndp_module_attach_alloc(req->ns);
+
+			req->ns->ndpm->eft = eft;
+			req->ns->ndpm->persist = persist;
+			req->ns->ndpm->shared = shared;
+			req->ns->ndpm->priv_level = 0;
+			ndp_module_dl_volatile(req);
 			return;
 		}
 	case 1:
 		// Remove
-		ndp_module_remove(req, &nvmet_code_module);
+		ndp_module_remove(req);
 		return;
 	default:
 		nvmet_req_complete(req, NVME_SC_INVALID_FIELD);
 		return;
 	}
 }
+
 #endif
 
 u16 nvmet_bdev_parse_io_cmd(struct nvmet_req *req)

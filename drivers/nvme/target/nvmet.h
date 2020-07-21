@@ -56,28 +56,19 @@
 
 #ifdef CONFIG_NVME_TARGET_NDP_MODULE
 // HACK: bookmark
-// void nvmet_execute_download_ndpm(struct nvmet_req *req);
-// void nvmet_execute_activate_ndpm(struct nvmet_req *req);
-
-struct nvme_ndp_kern {
-	// TODO: kern data
-};
-
-extern struct ndp_module nvmet_code_module;
-
 enum nvmet_ndp_module_eft {
 	NVMET_NDP_MODULE_EBPF		= 0x01,
 };
 
-// TODO: probably don't need this, can move into namespace
 struct ndp_module {
-	bool loaded;
 	u8 eft;
 	bool persist;
 	bool shared;
 	int priv_level;
 
-	struct bpf_prog *bpf;
+	u8 user[8];	
+
+	struct bpf_prog *prog;
 };
 #endif
 
@@ -110,8 +101,8 @@ struct nvmet_ns {
 	struct pci_dev		*p2p_dev;
 
 #ifdef CONFIG_NVME_TARGET_NDP_MODULE
-	struct sk_filter __rcu * ns_filter;
-	atomic_t	ns_omem_alloc;	
+	// TODO: sync?
+ 	struct ndp_module *ndpm;
 #endif
 };
 
@@ -556,6 +547,23 @@ static inline __le16 to0based(u32 a)
 }
 
 #ifdef CONFIG_NVME_TARGET_NDP_MODULE
+
+struct nvmet_ndp_iter {
+	u16		operation;				// 1 - write | 2 - copy
+	u16		in_page_index;			// page
+	u16		in_length;
+	void 	*in_virt;				// input data (sg_virt + sg->offset)
+	u64		slba;					// starting logical block address
+	u16		lb_offset;				// logical block offset
+
+	u32		cdw10;
+	u32		cdw11;
+	u8		user[8];				// preserved
+	void	*out_page_virt;			// output data
+	u16		out_page_length;
+	u8		status;					// WW HH / Write Flag - Halt Flag
+};
+
 void nvmet_file_execute_ndp_module_mgmt(struct nvmet_req *req);
 // void nvmet_file_execute_ndp_copy(struct nvmet_req *req);
 #endif

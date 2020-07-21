@@ -1491,10 +1491,6 @@ static int __init nvmet_init(void)
 
 	nvmet_ana_group_enabled[NVMET_DEFAULT_ANA_GRPID] = 1;
 
-#ifdef CONFIG_NVME_TARGET_NDP_MODULE
-	nvmet_code_module.loaded = false;
-#endif
-
 	buffered_io_wq = alloc_workqueue("nvmet-buffered-io-wq",
 			WQ_MEM_RECLAIM, 0);
 	if (!buffered_io_wq) {

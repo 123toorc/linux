@@ -3952,10 +3952,12 @@ struct bpf_pidns_info {
 };
 
 #ifdef CONFIG_NVME_TARGET_NDP_MODULE
-struct nvme_ndp_buff {
-	// TODO: check NVME_IO_WRITE
-	void * data;  // pointer to the data
-	void * data_end; // data size
+struct nvme_ndp_data {
+	__u8	op;
+	void 	*in_data;
+	__u32 	in_data_len;
+	void 	*out_data;
+	__u32 	out_data_len;
 };
 #endif
 
