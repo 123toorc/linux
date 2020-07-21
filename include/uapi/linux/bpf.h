@@ -3951,7 +3951,6 @@ struct bpf_pidns_info {
 	__u32 tgid;
 };
 
-#ifdef CONFIG_NVME_TARGET_NDP_MODULE
 struct nvme_ndp_data {
 	__u8	op;
 	void 	*in_data;
@@ -3959,6 +3958,5 @@ struct nvme_ndp_data {
 	void 	*out_data;
 	__u32 	out_data_len;
 };
-#endif
 
 #endif /* _UAPI__LINUX_BPF_H__ */
