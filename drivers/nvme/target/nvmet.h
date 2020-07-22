@@ -66,9 +66,8 @@ struct ndp_module {
 	bool shared;
 	int priv_level;
 
-	u8 user[8];	
-
 	struct bpf_prog *prog;
+	struct nvme_ndp_context ctx;
 };
 #endif
 

@@ -11,12 +11,20 @@
 SEC("ndp1")
 int bpf_prog(struct nvme_ndp_data *ctx)
 {
-	int i = 0;
+	int i;
 	char *in = ctx->in_data;
 	char *out = ctx->out_data;
-
-	for (int i = 0; i < 1024; i++) {
-		out[i] = 'K';
+	
+	if (ctx->op) {
+		// WRITE
+		for (i = 0; i < 1024; i++) {
+			out[i] = 'K';
+		}
+	} else {
+		// READ
+		for (i = 0; i < 4096; i++) {
+			out[i] = i < 512 ? 'Y' : in[i];
+		}
 	}
 
 	return 0;

@@ -3951,26 +3951,12 @@ struct bpf_pidns_info {
 	__u32 tgid;
 };
 
-struct nvme_ndp_data {
+struct nvme_ndp_context {
 	__u8	op;
 	void 	*in_data;
 	__u32 	in_data_len;
 	void 	*out_data;
 	__u32 	out_data_len;
-};
-
-struct nvmet_ndp_iter {
-	__u8	op;
-	u8		user[8];
-
-	u16		page_size;
-	void 	*in_page_data;
-	
-	__u8	in_flag; // SH
-
-	void	*out_page_data;
-	u16		out_page_length;
-	u8		status;
 };
 
 #endif /* _UAPI__LINUX_BPF_H__ */

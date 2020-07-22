@@ -141,6 +141,25 @@ static void nvmet_bio_done(struct bio *bio)
 {
 	struct nvmet_req *req = bio->bi_private;
 
+#ifdef CONFIG_NVME_TARGET_NDP_MODULE
+	struct ndp_module *ndpm = req->ns->ndpm;
+
+	if (ndpm) {
+		if (ndpm->ctx.in_data) vfree(ndpm->ctx.in_data);
+		if (ndpm->ctx.out_data) {
+			if (ndpm->ctx.op == REQ_OP_READ) {
+				BPF_PROG_RUN(ndpm->prog, &ndpm->ctx);
+
+				if (req->transfer_len == ndpm->ctx.out_data_len) {
+					nvmet_copy_to_sgl(req, 0, ndpm->ctx.out_data, ndpm->ctx.out_data_len);
+				}
+				// TODO: report error when transfer_len != out_data_len
+			}
+			vfree(ndpm->ctx.out_data);
+		}
+	}
+#endif
+
 	nvmet_req_complete(req, blk_to_nvme_status(req, bio->bi_status));
 	if (bio != &req->b.inline_bio)
 		bio_put(bio);
@@ -148,24 +167,12 @@ static void nvmet_bio_done(struct bio *bio)
 
 #ifdef CONFIG_NVME_TARGET_NDP_MODULE
 
-static void nvmet_bio_ndp_read_done(struct bio *bio)
-{
-	struct nvmet_req *req = bio->bi_private;
-
-	if (req->ns->ndpm && req->cmd->rw.opcode == nvme_cmd_read) {
-		printk("HACK: bio_done\n");
-		((char *)sg_virt(req->sg))[0] = 'K';
-	}
-
-	nvmet_req_complete(req, blk_to_nvme_status(req, bio->bi_status));
-	if (bio != &req->b.inline_bio)
-		bio_put(bio);
-}
-
 // TODO: combine rw?
 static void nvmet_bdev_execute_ndp_write(struct nvmet_req *req)
 {
 	int sg_cnt = req->sg_cnt;
+	struct ndp_module *ndpm = req->ns->ndpm;
+
 	struct bio *bio;
 	struct scatterlist *sg;
 	struct blk_plug plug;
@@ -173,9 +180,7 @@ static void nvmet_bdev_execute_ndp_write(struct nvmet_req *req)
 	int op, i, nent;
 
 
-	struct bpf_prog *prog;
-	struct nvme_ndp_data ctx;
-	struct sg_table out_sg;
+	struct sg_table out_sgt;
 	struct page *vm_page;
 	void *buf;
 	int res, min, len;
@@ -204,40 +209,39 @@ static void nvmet_bdev_execute_ndp_write(struct nvmet_req *req)
 		bio = bio_alloc(GFP_KERNEL, min(sg_cnt, BIO_MAX_PAGES));
 	}
 
-	printk("HACK: sgl_len: %ld\n", sgl_len);
-	printk("HACK: blk_len: %d\n", blk_len);
-	if (req->ns->ndpm) {
-		prog = req->ns->ndpm->prog;
+	if (ndpm || sgl_len != blk_len) {
+		ndpm->ctx.op = REQ_OP_WRITE;
+		ndpm->ctx.in_data = vmalloc(sgl_len);
+		nvmet_copy_from_sgl(req, 0, ndpm->ctx.in_data, sgl_len);
+		ndpm->ctx.in_data_len = sgl_len;
 
-		ctx.op = op & REQ_OP_WRITE;
-		ctx.in_data = vmalloc(sgl_len);
-		sg_copy_to_buffer(req->sg, req->sg_cnt, ctx.in_data, sgl_len);
-		ctx.in_data_len = sgl_len;
+		ndpm->ctx.out_data = vzalloc(blk_len);
+		ndpm->ctx.out_data_len = blk_len;
 
-		ctx.out_data = vzalloc(blk_len);
-		ctx.out_data_len = blk_len;
-
-		res = BPF_PROG_RUN(prog, &ctx);
+		res = BPF_PROG_RUN(ndpm->prog, &ndpm->ctx);
 		printk("HACK: applying ebpf (write), res: %d\n", res);
 
-		// Create SG
-		nent = DIV_ROUND_UP(blk_len + offset_in_page(ctx.out_data), PAGE_SIZE);
+		// to be safe
+		ndpm->ctx.op = REQ_OP_WRITE;
 
-		sg_alloc_table(&out_sg, nent, GFP_KERNEL);
-		sg = out_sg.sgl;
+		// Create SG
+		nent = DIV_ROUND_UP(blk_len + offset_in_page(ndpm->ctx.out_data), PAGE_SIZE);
+
+		sg_alloc_table(&out_sgt, nent, GFP_KERNEL);
+		sg = out_sgt.sgl;
 		
-		buf = ctx.out_data;
+		buf = ndpm->ctx.out_data;
 		len = blk_len;
 
-		for (i = 0; i < nent; i++) {
+		for (i = 0; i < nent; ++i) {
 				min = min_t(size_t, PAGE_SIZE,
 						min_t(size_t, len,
 						PAGE_SIZE - offset_in_page(buf)));
 					vm_page = vmalloc_to_page(buf);
 
 				if (!vm_page) {
-					sg_free_table(&out_sg);
-					nvmet_req_complete(req, 0); // TODO
+					sg_free_table(&out_sgt);
+					nvmet_req_complete(req, 0); // TODO: report error
 					return;
 				}
 
@@ -249,7 +253,7 @@ static void nvmet_bdev_execute_ndp_write(struct nvmet_req *req)
 			sg = sg_next(sg);
 		}
 
-		sgl = out_sg.sgl;
+		sgl = out_sgt.sgl;
 	} else {
 		sgl = req->sg;
 		nent = req->sg_cnt;
@@ -287,12 +291,14 @@ static void nvmet_bdev_execute_ndp_write(struct nvmet_req *req)
 	submit_bio(bio);
 	blk_finish_plug(&plug);
 
-	sg_free_table(&out_sg);
+	sg_free_table(&out_sgt);
 }
 
 static void nvmet_bdev_execute_ndp_read(struct nvmet_req *req)
 {
 	int sg_cnt = req->sg_cnt;
+	struct ndp_module *ndpm = req->ns->ndpm;
+
 	struct bio *bio;
 	struct scatterlist *sg;
 	struct blk_plug plug;
@@ -300,12 +306,10 @@ static void nvmet_bdev_execute_ndp_read(struct nvmet_req *req)
 	int op, i, nent;
 
 
-	struct bpf_prog *prog;
-	struct nvme_ndp_data ctx;
-	struct sg_table out_sg;
+	struct sg_table in_sgt;
 	struct page *vm_page;
 	void *buf;
-	int res, min, len;
+	int min, len;
 
 	struct scatterlist *sgl;
 
@@ -317,9 +321,7 @@ static void nvmet_bdev_execute_ndp_read(struct nvmet_req *req)
 		return;
 	}
 
-	op = REQ_OP_WRITE | REQ_SYNC | REQ_IDLE;
-	if (req->cmd->rw.control & cpu_to_le16(NVME_RW_FUA))
-		op |= REQ_FUA;
+	op = REQ_OP_READ;
 
 	sector = le64_to_cpu(req->cmd->rw.slba);
 	sector <<= (req->ns->blksize_shift - 9);
@@ -331,40 +333,32 @@ static void nvmet_bdev_execute_ndp_read(struct nvmet_req *req)
 		bio = bio_alloc(GFP_KERNEL, min(sg_cnt, BIO_MAX_PAGES));
 	}
 
-	printk("HACK: sgl_len: %ld\n", sgl_len);
-	printk("HACK: blk_len: %d\n", blk_len);
-	if (req->ns->ndpm) {
-		prog = req->ns->ndpm->prog;
+	if (ndpm || sgl_len != blk_len) {
+		ndpm->ctx.op = REQ_OP_READ;
+		ndpm->ctx.out_data = vzalloc(sgl_len);
+		ndpm->ctx.out_data_len = sgl_len;
 
-		ctx.op = op & REQ_OP_WRITE;
-		ctx.in_data = vmalloc(sgl_len);
-		sg_copy_to_buffer(req->sg, req->sg_cnt, ctx.in_data, sgl_len);
-		ctx.in_data_len = sgl_len;
-
-		ctx.out_data = vzalloc(blk_len);
-		ctx.out_data_len = blk_len;
-
-		res = BPF_PROG_RUN(prog, &ctx);
-		printk("HACK: applying ebpf (write), res: %d\n", res);
+		ndpm->ctx.in_data = vmalloc(blk_len);
+		ndpm->ctx.in_data_len = blk_len;
 
 		// Create SG
-		nent = DIV_ROUND_UP(blk_len + offset_in_page(ctx.out_data), PAGE_SIZE);
+		nent = DIV_ROUND_UP(blk_len + offset_in_page(ndpm->ctx.in_data), PAGE_SIZE);
 
-		sg_alloc_table(&out_sg, nent, GFP_KERNEL);
-		sg = out_sg.sgl;
+		sg_alloc_table(&in_sgt, nent, GFP_KERNEL);
+		sg = in_sgt.sgl;
 		
-		buf = ctx.out_data;
+		buf = ndpm->ctx.in_data;
 		len = blk_len;
 
-		for (i = 0; i < nent; i++) {
+		for (i = 0; i < nent; ++i) {
 				min = min_t(size_t, PAGE_SIZE,
 						min_t(size_t, len,
 						PAGE_SIZE - offset_in_page(buf)));
 					vm_page = vmalloc_to_page(buf);
 
 				if (!vm_page) {
-					sg_free_table(&out_sg);
-					nvmet_req_complete(req, 0); // TODO
+					sg_free_table(&in_sgt);
+					nvmet_req_complete(req, 0); // TODO: report error
 					return;
 				}
 
@@ -376,7 +370,7 @@ static void nvmet_bdev_execute_ndp_read(struct nvmet_req *req)
 			sg = sg_next(sg);
 		}
 
-		sgl = out_sg.sgl;
+		sgl = in_sgt.sgl;
 	} else {
 		sgl = req->sg;
 		nent = req->sg_cnt;
@@ -414,8 +408,9 @@ static void nvmet_bdev_execute_ndp_read(struct nvmet_req *req)
 	submit_bio(bio);
 	blk_finish_plug(&plug);
 
-	sg_free_table(&out_sg);
+	sg_free_table(&in_sgt);
 }
+
 
 #endif
 
@@ -687,7 +682,6 @@ static void ndp_module_dl_volatile(struct nvmet_req *req) {
 
 	fp = bpf_prog_select_runtime(fp, &err);
 	if (err) {
-		printk("jit failed");
 		ndp_module_remove(req);
 		nvmet_req_complete(req, NVME_SC_INVALID_FIELD);
 		return;
