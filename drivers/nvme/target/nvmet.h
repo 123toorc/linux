@@ -548,22 +548,6 @@ static inline __le16 to0based(u32 a)
 
 #ifdef CONFIG_NVME_TARGET_NDP_MODULE
 
-struct nvmet_ndp_iter {
-	u16		operation;				// 1 - write | 2 - copy
-	u16		in_page_index;			// page
-	u16		in_length;
-	void 	*in_virt;				// input data (sg_virt + sg->offset)
-	u64		slba;					// starting logical block address
-	u16		lb_offset;				// logical block offset
-
-	u32		cdw10;
-	u32		cdw11;
-	u8		user[8];				// preserved
-	void	*out_page_virt;			// output data
-	u16		out_page_length;
-	u8		status;					// WW HH / Write Flag - Halt Flag
-};
-
 void nvmet_file_execute_ndp_module_mgmt(struct nvmet_req *req);
 // void nvmet_file_execute_ndp_copy(struct nvmet_req *req);
 #endif

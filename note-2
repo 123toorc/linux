@@ -10,4 +10,10 @@ sudo nvme io-passthru /dev/nvme0 -n 1 -o 0x21 -5 256
 # ndp_output
 sudo nvme io-passthru /dev/nvme0 -n 1 -o 0x21 -4 8224 -5 0 -l 8224 -i ndp_output -w
 
-sudo nvme write /dev/nvme0n1 -s 0 -z 6764 -d large.txt
+sudo nvme write /dev/nvme0n1 -s 0 -c 14 -z 6765 -d large.txt
+
+sudo rm large.out
+sudo nvme read /dev/nvme0n1 -s 0 -c 14 -z 6765 8 -d large.out
+
+# read
+sudo nvme io-passthru /dev/nvme0 -n 1 -o 0x02 -l 6765 -4 0 -5 0 -6 14 -r

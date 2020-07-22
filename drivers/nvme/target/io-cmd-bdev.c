@@ -146,6 +146,279 @@ static void nvmet_bio_done(struct bio *bio)
 		bio_put(bio);
 }
 
+#ifdef CONFIG_NVME_TARGET_NDP_MODULE
+
+static void nvmet_bio_ndp_read_done(struct bio *bio)
+{
+	struct nvmet_req *req = bio->bi_private;
+
+	if (req->ns->ndpm && req->cmd->rw.opcode == nvme_cmd_read) {
+		printk("HACK: bio_done\n");
+		((char *)sg_virt(req->sg))[0] = 'K';
+	}
+
+	nvmet_req_complete(req, blk_to_nvme_status(req, bio->bi_status));
+	if (bio != &req->b.inline_bio)
+		bio_put(bio);
+}
+
+// TODO: combine rw?
+static void nvmet_bdev_execute_ndp_write(struct nvmet_req *req)
+{
+	int sg_cnt = req->sg_cnt;
+	struct bio *bio;
+	struct scatterlist *sg;
+	struct blk_plug plug;
+	sector_t sector;
+	int op, i, nent;
+
+
+	struct bpf_prog *prog;
+	struct nvme_ndp_data ctx;
+	struct sg_table out_sg;
+	struct page *vm_page;
+	void *buf;
+	int res, min, len;
+
+	struct scatterlist *sgl;
+
+	size_t sgl_len = req->transfer_len;
+	u32 blk_len = nvmet_rw_len(req);
+
+	if (!req->sg_cnt) {
+		nvmet_req_complete(req, 0);
+		return;
+	}
+
+	op = REQ_OP_WRITE | REQ_SYNC | REQ_IDLE;
+	if (req->cmd->rw.control & cpu_to_le16(NVME_RW_FUA))
+		op |= REQ_FUA;
+
+	sector = le64_to_cpu(req->cmd->rw.slba);
+	sector <<= (req->ns->blksize_shift - 9);
+
+	if (req->transfer_len <= NVMET_MAX_INLINE_DATA_LEN) {
+		bio = &req->b.inline_bio;
+		bio_init(bio, req->inline_bvec, ARRAY_SIZE(req->inline_bvec));
+	} else {
+		bio = bio_alloc(GFP_KERNEL, min(sg_cnt, BIO_MAX_PAGES));
+	}
+
+	printk("HACK: sgl_len: %ld\n", sgl_len);
+	printk("HACK: blk_len: %d\n", blk_len);
+	if (req->ns->ndpm) {
+		prog = req->ns->ndpm->prog;
+
+		ctx.op = op & REQ_OP_WRITE;
+		ctx.in_data = vmalloc(sgl_len);
+		sg_copy_to_buffer(req->sg, req->sg_cnt, ctx.in_data, sgl_len);
+		ctx.in_data_len = sgl_len;
+
+		ctx.out_data = vzalloc(blk_len);
+		ctx.out_data_len = blk_len;
+
+		res = BPF_PROG_RUN(prog, &ctx);
+		printk("HACK: applying ebpf (write), res: %d\n", res);
+
+		// Create SG
+		nent = DIV_ROUND_UP(blk_len + offset_in_page(ctx.out_data), PAGE_SIZE);
+
+		sg_alloc_table(&out_sg, nent, GFP_KERNEL);
+		sg = out_sg.sgl;
+		
+		buf = ctx.out_data;
+		len = blk_len;
+
+		for (i = 0; i < nent; i++) {
+				min = min_t(size_t, PAGE_SIZE,
+						min_t(size_t, len,
+						PAGE_SIZE - offset_in_page(buf)));
+					vm_page = vmalloc_to_page(buf);
+
+				if (!vm_page) {
+					sg_free_table(&out_sg);
+					nvmet_req_complete(req, 0); // TODO
+					return;
+				}
+
+				sg_set_page(sg, vm_page,
+						min, offset_in_page(buf));
+
+			buf += min;
+			len -= min;
+			sg = sg_next(sg);
+		}
+
+		sgl = out_sg.sgl;
+	} else {
+		sgl = req->sg;
+		nent = req->sg_cnt;
+		
+		if (is_pci_p2pdma_page(sg_page(req->sg)))
+			op |= REQ_NOMERGE;
+	}
+
+	bio_set_dev(bio, req->ns->bdev);
+	bio->bi_iter.bi_sector = sector;
+	bio->bi_private = req;
+	bio->bi_end_io = nvmet_bio_done;
+	bio->bi_opf = op;
+
+	blk_start_plug(&plug);
+
+	for_each_sg(sgl, sg, nent, i) {
+		while (bio_add_page(bio, sg_page(sg), sg->length, sg->offset)
+				!= sg->length) {
+			struct bio *prev = bio;
+
+			bio = bio_alloc(GFP_KERNEL, min(sg_cnt, BIO_MAX_PAGES));
+			bio_set_dev(bio, req->ns->bdev);
+			bio->bi_iter.bi_sector = sector;
+			bio->bi_opf = op;
+
+			bio_chain(bio, prev);
+			submit_bio(prev);
+		}
+
+		sector += sg->length >> 9;
+		sg_cnt--;
+	}
+
+	submit_bio(bio);
+	blk_finish_plug(&plug);
+
+	sg_free_table(&out_sg);
+}
+
+static void nvmet_bdev_execute_ndp_read(struct nvmet_req *req)
+{
+	int sg_cnt = req->sg_cnt;
+	struct bio *bio;
+	struct scatterlist *sg;
+	struct blk_plug plug;
+	sector_t sector;
+	int op, i, nent;
+
+
+	struct bpf_prog *prog;
+	struct nvme_ndp_data ctx;
+	struct sg_table out_sg;
+	struct page *vm_page;
+	void *buf;
+	int res, min, len;
+
+	struct scatterlist *sgl;
+
+	size_t sgl_len = req->transfer_len;
+	u32 blk_len = nvmet_rw_len(req);
+
+	if (!req->sg_cnt) {
+		nvmet_req_complete(req, 0);
+		return;
+	}
+
+	op = REQ_OP_WRITE | REQ_SYNC | REQ_IDLE;
+	if (req->cmd->rw.control & cpu_to_le16(NVME_RW_FUA))
+		op |= REQ_FUA;
+
+	sector = le64_to_cpu(req->cmd->rw.slba);
+	sector <<= (req->ns->blksize_shift - 9);
+
+	if (req->transfer_len <= NVMET_MAX_INLINE_DATA_LEN) {
+		bio = &req->b.inline_bio;
+		bio_init(bio, req->inline_bvec, ARRAY_SIZE(req->inline_bvec));
+	} else {
+		bio = bio_alloc(GFP_KERNEL, min(sg_cnt, BIO_MAX_PAGES));
+	}
+
+	printk("HACK: sgl_len: %ld\n", sgl_len);
+	printk("HACK: blk_len: %d\n", blk_len);
+	if (req->ns->ndpm) {
+		prog = req->ns->ndpm->prog;
+
+		ctx.op = op & REQ_OP_WRITE;
+		ctx.in_data = vmalloc(sgl_len);
+		sg_copy_to_buffer(req->sg, req->sg_cnt, ctx.in_data, sgl_len);
+		ctx.in_data_len = sgl_len;
+
+		ctx.out_data = vzalloc(blk_len);
+		ctx.out_data_len = blk_len;
+
+		res = BPF_PROG_RUN(prog, &ctx);
+		printk("HACK: applying ebpf (write), res: %d\n", res);
+
+		// Create SG
+		nent = DIV_ROUND_UP(blk_len + offset_in_page(ctx.out_data), PAGE_SIZE);
+
+		sg_alloc_table(&out_sg, nent, GFP_KERNEL);
+		sg = out_sg.sgl;
+		
+		buf = ctx.out_data;
+		len = blk_len;
+
+		for (i = 0; i < nent; i++) {
+				min = min_t(size_t, PAGE_SIZE,
+						min_t(size_t, len,
+						PAGE_SIZE - offset_in_page(buf)));
+					vm_page = vmalloc_to_page(buf);
+
+				if (!vm_page) {
+					sg_free_table(&out_sg);
+					nvmet_req_complete(req, 0); // TODO
+					return;
+				}
+
+				sg_set_page(sg, vm_page,
+						min, offset_in_page(buf));
+
+			buf += min;
+			len -= min;
+			sg = sg_next(sg);
+		}
+
+		sgl = out_sg.sgl;
+	} else {
+		sgl = req->sg;
+		nent = req->sg_cnt;
+		
+		if (is_pci_p2pdma_page(sg_page(req->sg)))
+			op |= REQ_NOMERGE;
+	}
+
+	bio_set_dev(bio, req->ns->bdev);
+	bio->bi_iter.bi_sector = sector;
+	bio->bi_private = req;
+	bio->bi_end_io = nvmet_bio_done;
+	bio->bi_opf = op;
+
+	blk_start_plug(&plug);
+
+	for_each_sg(sgl, sg, nent, i) {
+		while (bio_add_page(bio, sg_page(sg), sg->length, sg->offset)
+				!= sg->length) {
+			struct bio *prev = bio;
+
+			bio = bio_alloc(GFP_KERNEL, min(sg_cnt, BIO_MAX_PAGES));
+			bio_set_dev(bio, req->ns->bdev);
+			bio->bi_iter.bi_sector = sector;
+			bio->bi_opf = op;
+
+			bio_chain(bio, prev);
+			submit_bio(prev);
+		}
+
+		sector += sg->length >> 9;
+		sg_cnt--;
+	}
+
+	submit_bio(bio);
+	blk_finish_plug(&plug);
+
+	sg_free_table(&out_sg);
+}
+
+#endif
+
 static void nvmet_bdev_execute_rw(struct nvmet_req *req)
 {
 	int sg_cnt = req->sg_cnt;
@@ -155,17 +428,8 @@ static void nvmet_bdev_execute_rw(struct nvmet_req *req)
 	sector_t sector;
 	int op, i;
 
-#ifdef CONFIG_NVME_TARGET_NDP_MODULE
-	struct bpf_prog *prog;
-	struct nvme_ndp_data ctx;
-	int res;
-
-	size_t sgl_len = req->transfer_len;
-	u32 blk_len = nvmet_rw_len(req);
-#else
 	if (!nvmet_check_data_len(req, nvmet_rw_len(req)))
 		return;
-#endif
 
 	if (!req->sg_cnt) {
 		nvmet_req_complete(req, 0);
@@ -197,27 +461,6 @@ static void nvmet_bdev_execute_rw(struct nvmet_req *req)
 	bio->bi_private = req;
 	bio->bi_end_io = nvmet_bio_done;
 	bio->bi_opf = op;
-
-#ifdef CONFIG_NVME_TARGET_NDP_MODULE
-	if (req->ns->ndpm) {
-		prog = req->ns->ndpm->prog;
-
-		ctx.op = op & REQ_OP_WRITE;
-		ctx.in_data = vmalloc(sgl_len);
-		sg_copy_to_buffer(req->sg, req->sg_cnt, ctx.in_data, sgl_len);
-		ctx.in_data_len = sgl_len;
-
-		ctx.out_data = vzalloc(blk_len);
-		ctx.out_data_len = blk_len;
-
-		// TODO: create SGL for out_data
-
-		res = BPF_PROG_RUN(prog, &ctx);
-		printk("HACK: applying ebpf, res: %d\n", res);
-		printk("HACK: in_data: %s\n", (char *)ctx.in_data);
-		printk("HACK: out_data: %s\n", (char *)ctx.out_data);
-	}
-#endif
 
 	blk_start_plug(&plug);
 
@@ -505,10 +748,19 @@ u16 nvmet_bdev_parse_io_cmd(struct nvmet_req *req)
 	struct nvme_command *cmd = req->cmd;
 
 	switch (cmd->common.opcode) {
+#ifdef CONFIG_NVME_TARGET_NDP_MODULE
+	case nvme_cmd_read:
+		req->execute = nvmet_bdev_execute_ndp_read;
+		return 0;
+	case nvme_cmd_write:
+		req->execute = nvmet_bdev_execute_ndp_write;
+		return 0;
+#else
 	case nvme_cmd_read:
 	case nvme_cmd_write:
 		req->execute = nvmet_bdev_execute_rw;
 		return 0;
+#endif
 	case nvme_cmd_flush:
 		req->execute = nvmet_bdev_execute_flush;
 		return 0;
