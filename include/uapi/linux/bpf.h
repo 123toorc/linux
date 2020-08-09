@@ -3953,10 +3953,14 @@ struct bpf_pidns_info {
 
 struct nvme_ndp_context {
 	__u8	op;
+	__u32	iter;
 	void 	*in_data;
 	__u32 	in_data_len;
 	void 	*out_data;
 	__u32 	out_data_len;
+	
+	__u32	udw[4];
+	__u8	flag;
 };
 
 #endif /* _UAPI__LINUX_BPF_H__ */

@@ -143,12 +143,29 @@ static void nvmet_bio_done(struct bio *bio)
 
 #ifdef CONFIG_NVME_TARGET_NDP_MODULE
 	struct ndp_module *ndpm = req->ns->ndpm;
+	// TODO: multiple progs
+	u32 prog_id = le32_to_cpu(req->cmd->common.cdw2[0]);
+	u32 max_iter = le32_to_cpu(req->cmd->common.cdw2[1]);
+	bool active = prog_id && ndpm;
+	int res, i;
 
-	if (ndpm) {
+	if (active) {
 		if (ndpm->ctx.in_data) vfree(ndpm->ctx.in_data);
 		if (ndpm->ctx.out_data) {
 			if (ndpm->ctx.op == REQ_OP_READ) {
-				BPF_PROG_RUN(ndpm->prog, &ndpm->ctx);
+				for (i = 0; i < max_iter; ++i) {
+					res = BPF_PROG_RUN(ndpm->prog, &ndpm->ctx);
+					if (res) {
+						// complete req early without copying output data
+						nvmet_req_complete(req, NVME_SC_SGL_INVALID_DATA | NVME_SC_DNR);
+						return;
+					}
+
+					if (ndpm->ctx.flag) {
+						// iteration halt
+						break;
+					}
+				}
 
 				if (req->transfer_len == ndpm->ctx.out_data_len) {
 					nvmet_copy_to_sgl(req, 0, ndpm->ctx.out_data, ndpm->ctx.out_data_len);
@@ -179,6 +196,10 @@ static void nvmet_bdev_execute_ndp_write(struct nvmet_req *req)
 	sector_t sector;
 	int op, i, nent;
 
+	// TODO: multiple progs
+	u32 prog_id = le32_to_cpu(req->cmd->common.cdw2[0]);
+	u32 max_iter = le32_to_cpu(req->cmd->common.cdw2[1]);
+	bool active = prog_id && ndpm;
 
 	struct sg_table out_sgt;
 	struct page *vm_page;
@@ -189,6 +210,11 @@ static void nvmet_bdev_execute_ndp_write(struct nvmet_req *req)
 
 	size_t sgl_len = req->transfer_len;
 	u32 blk_len = nvmet_rw_len(req);
+
+	if (!active && sgl_len != blk_len) {
+		nvmet_req_complete(req, NVME_SC_SGL_INVALID_DATA | NVME_SC_DNR);
+		return;
+	}
 
 	if (!req->sg_cnt) {
 		nvmet_req_complete(req, 0);
@@ -209,7 +235,7 @@ static void nvmet_bdev_execute_ndp_write(struct nvmet_req *req)
 		bio = bio_alloc(GFP_KERNEL, min(sg_cnt, BIO_MAX_PAGES));
 	}
 
-	if (ndpm || sgl_len != blk_len) {
+	if (active) {
 		ndpm->ctx.op = REQ_OP_WRITE;
 		ndpm->ctx.in_data = vmalloc(sgl_len);
 		nvmet_copy_from_sgl(req, 0, ndpm->ctx.in_data, sgl_len);
@@ -218,7 +244,25 @@ static void nvmet_bdev_execute_ndp_write(struct nvmet_req *req)
 		ndpm->ctx.out_data = vzalloc(blk_len);
 		ndpm->ctx.out_data_len = blk_len;
 
-		res = BPF_PROG_RUN(ndpm->prog, &ndpm->ctx);
+		for (i = 0; i < max_iter; ++i) {
+			res = BPF_PROG_RUN(ndpm->prog, &ndpm->ctx);
+			if (res) {
+				// discard allocated bio
+				if (bio != &req->b.inline_bio) {
+					bio_put(bio);
+				}
+
+				// complete req early without modifying disk
+				nvmet_req_complete(req, NVME_SC_SGL_INVALID_DATA | NVME_SC_DNR);
+				return;
+			}
+
+			if (ndpm->ctx.flag) {
+				// iteration halt
+				break;
+			}
+		}
+		
 		printk("HACK: applying ebpf (write), res: %d\n", res);
 
 		// to be safe
@@ -305,6 +349,9 @@ static void nvmet_bdev_execute_ndp_read(struct nvmet_req *req)
 	sector_t sector;
 	int op, i, nent;
 
+	// TODO: multiple progs
+	u32 prog_id = le32_to_cpu(req->cmd->common.cdw2[0]);
+	bool active = prog_id && ndpm;
 
 	struct sg_table in_sgt;
 	struct page *vm_page;
@@ -315,6 +362,11 @@ static void nvmet_bdev_execute_ndp_read(struct nvmet_req *req)
 
 	size_t sgl_len = req->transfer_len;
 	u32 blk_len = nvmet_rw_len(req);
+
+	if (!active && sgl_len != blk_len) {
+		nvmet_req_complete(req, NVME_SC_SGL_INVALID_DATA | NVME_SC_DNR);
+		return;
+	}
 
 	if (!req->sg_cnt) {
 		nvmet_req_complete(req, 0);
@@ -333,7 +385,7 @@ static void nvmet_bdev_execute_ndp_read(struct nvmet_req *req)
 		bio = bio_alloc(GFP_KERNEL, min(sg_cnt, BIO_MAX_PAGES));
 	}
 
-	if (ndpm || sgl_len != blk_len) {
+	if (active) {
 		ndpm->ctx.op = REQ_OP_READ;
 		ndpm->ctx.out_data = vzalloc(sgl_len);
 		ndpm->ctx.out_data_len = sgl_len;
@@ -630,7 +682,7 @@ static void ndp_module_dl_volatile(struct nvmet_req *req) {
 	u32 code_len = cdw10;
 	int insn_cnt = code_len / sizeof(struct bpf_insn);
 	struct bpf_prog *fp;
-	int err = 0, i = 0;
+	int err = 0;
 
 	if (insn_cnt > U16_MAX) {
 		// instruction limit

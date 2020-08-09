@@ -1,23 +1,17 @@
 #include <uapi/linux/bpf.h>
 #include <bpf/bpf_helpers.h>
 
-// struct bpf_map_def SEC("maps") my_map = {
-//         .type = BPF_MAP_TYPE_ARRAY,
-//         .key_size = sizeof(u32),
-//         .value_size = sizeof(long),
-//         .max_entries = 128,
-// };
-
-SEC("ndp1")
-int bpf_prog(struct nvme_ndp_data *ctx)
+SEC("nvme_ndpm")
+int nvme_ndpm(struct nvme_ndp_context *ctx)
 {
 	int i;
 	char *in = ctx->in_data;
 	char *out = ctx->out_data;
+	unsigned int len = ctx->out_data_len;
 	
 	if (ctx->op) {
 		// WRITE
-		for (i = 0; i < 1024; i++) {
+		for (i = 0; i < len; i++) {
 			out[i] = 'K';
 		}
 	} else {
@@ -27,6 +21,7 @@ int bpf_prog(struct nvme_ndp_data *ctx)
 		}
 	}
 
+	ctx->flag = 1;
 	return 0;
 }
 char _license[] SEC("license") = "GPL";

@@ -170,7 +170,10 @@ always-y += ibumad_kern.o
 always-y += hbm_out_kern.o
 always-y += hbm_edt_kern.o
 always-y += xdpsock_kern.o
-always-y += ndp1_kern.o
+always-y += ndp_simple.o
+always-y += ndp_grep.o
+always-y += ndp_wc.o
+always-y += ndp_snappy.o
 
 ifeq ($(ARCH), arm)
 # Strip all except -D__LINUX_ARM_ARCH__ option needed to handle linux
@@ -236,7 +239,7 @@ BTF_LLVM_PROBE := $(shell echo "int main() { return 0; }" | \
 			  readelf -S ./llvm_btf_verify.o | grep BTF; \
 			  /bin/rm -f ./llvm_btf_verify.o)
 
-BPF_EXTRA_CFLAGS += -fno-stack-protector
+BPF_EXTRA_CFLAGS += -fno-stack-protector -fno-builtin
 ifneq ($(BTF_LLVM_PROBE),)
 	BPF_EXTRA_CFLAGS += -g
 else
