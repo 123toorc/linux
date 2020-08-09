@@ -149,14 +149,16 @@ static void nvmet_bio_done(struct bio *bio)
 	bool active = prog_id && ndpm;
 	int res, i;
 
+	printk("done: prog_id: %d, max_iter: %d\n", prog_id, max_iter);
+
 	if (active) {
-		if (ndpm->ctx.in_data) vfree(ndpm->ctx.in_data);
 		if (ndpm->ctx.out_data) {
 			if (ndpm->ctx.op == REQ_OP_READ) {
 				for (i = 0; i < max_iter; ++i) {
 					res = BPF_PROG_RUN(ndpm->prog, &ndpm->ctx);
 					if (res) {
 						// complete req early without copying output data
+						printk("prog failed\n");
 						nvmet_req_complete(req, NVME_SC_SGL_INVALID_DATA | NVME_SC_DNR);
 						return;
 					}
@@ -168,12 +170,14 @@ static void nvmet_bio_done(struct bio *bio)
 				}
 
 				if (req->transfer_len == ndpm->ctx.out_data_len) {
+					printk("transfer len mismatch %d %d\n", req->transfer_len, ndpm->ctx.out_data_len);
 					nvmet_copy_to_sgl(req, 0, ndpm->ctx.out_data, ndpm->ctx.out_data_len);
 				}
 				// TODO: report error when transfer_len != out_data_len
 			}
 			vfree(ndpm->ctx.out_data);
 		}
+		if (ndpm->ctx.in_data) vfree(ndpm->ctx.in_data);
 	}
 #endif
 
@@ -363,7 +367,10 @@ static void nvmet_bdev_execute_ndp_read(struct nvmet_req *req)
 	size_t sgl_len = req->transfer_len;
 	u32 blk_len = nvmet_rw_len(req);
 
+	printk("prog_id: %d\n", prog_id);
+
 	if (!active && sgl_len != blk_len) {
+		printk("direct copy failed\n");
 		nvmet_req_complete(req, NVME_SC_SGL_INVALID_DATA | NVME_SC_DNR);
 		return;
 	}

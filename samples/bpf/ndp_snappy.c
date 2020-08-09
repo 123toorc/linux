@@ -2,7 +2,7 @@
 #include <bpf/bpf_helpers.h>
 
 SEC("nvme_ndpm")
-int nvme_ndpm(struct nvme_ndp_context *ctx)
+int module(struct nvme_ndp_context *ctx)
 {
 	int i;
 	char *in = ctx->in_data;
