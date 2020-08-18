@@ -6,8 +6,6 @@
 #define COPY_2_BYTE_OFFSET 2
 #define COPY_4_BYTE_OFFSET 3
 
-#define memmove(dest, src, len) bpf_probe_read(dest, len, src)
-
 static const u32 wordmask[] = {
 	0u, 0xffu, 0xffffu, 0xffffffu, 0xffffffffu
 };
@@ -95,6 +93,15 @@ static inline bool writer_check_length(struct writer *w)
 	return w->op == w->op_limit;
 }
 
+static inline void movedata(void *dest, const void* src, u32 len)
+{
+	int i = 0;
+	char *d = (char*)dest, *s = (char*)src;
+	for (i = 0; i < len; ++i) {
+		d[i] = s[i];
+	}
+}
+
 static inline bool writer_append_from_self(struct writer *w, u32 offset,
 					   u32 len)
 {
@@ -129,7 +136,7 @@ static inline bool writer_append(struct writer *w, const char *ip, u32 len)
 	const u32 space_left = w->op_limit - op;
 	if (space_left < len)
 		return false;
-	bpf_probe_read(op, len, ip);
+	movedata(op, ip, len);
 	w->op = op + len;
 	return true;
 }
@@ -225,7 +232,7 @@ static bool refill_tag(struct snappy_decompressor *d)
 		 * will be consumed immediately by the caller since we do not
 		 * read more than we need.
 		 */
-		memmove(d->scratch, ip, nbuf);
+		movedata(d->scratch, ip, nbuf);
 		skip(d->reader, d->peeked); /* All peeked bytes are used up */
 		d->peeked = 0;
 		while (nbuf < needed) {
@@ -234,7 +241,7 @@ static bool refill_tag(struct snappy_decompressor *d)
 			if (length == 0)
 				return false;
 			u32 to_add = (needed - nbuf) < length ? (needed - nbuf) : length;
-			bpf_probe_read(d->scratch + nbuf, to_add, src);
+			movedata(d->scratch + nbuf, src, to_add);
 			nbuf += to_add;
 			skip(d->reader, to_add);
 		}
@@ -246,7 +253,7 @@ static bool refill_tag(struct snappy_decompressor *d)
 		 * Have enough bytes, but move into scratch so that we do not
 		 * read past end of input
 		 */
-		memmove(d->scratch, ip, nbuf);
+		movedata(d->scratch, ip, nbuf);
 		skip(d->reader, d->peeked); /* All peeked bytes are used up */
 		d->peeked = 0;
 		d->ip = d->scratch;
