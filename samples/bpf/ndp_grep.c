@@ -18,7 +18,7 @@ int module(struct nvme_ndp_context *ctx)
 
 	for (i = 0; i < ctx->in_data_len; ++i) {
 		if (skipping) {
-            if (in[i] == '\n') {
+            if (in[i] == '\n' || in[i] == '\0') {
                 skipping = 0;
                 for (k = b; k < i; ++k) {
                     if (o >= len - 1) return 0;
@@ -44,6 +44,7 @@ int module(struct nvme_ndp_context *ctx)
     if (skipping) {
         for (k = b; k < ctx->in_data_len; ++k) {
             if (o >= len - 1) return 0;
+            if (in[k] == '\0') break;
             out[o++] = in[k];
         }
         if (o >= len - 1) return 0;
