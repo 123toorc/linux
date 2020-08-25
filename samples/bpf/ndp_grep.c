@@ -4,7 +4,6 @@
 #define PATTERN "search_pattern"
 #define PATTERN_LEN 14
 
-SEC("nvme_ndpm")
 int module(struct nvme_ndp_context *ctx)
 {
 	unsigned int i, j, k, o = 0, b = 0;

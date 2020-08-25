@@ -373,7 +373,6 @@ static int internal_uncompress(struct source *r,
 	return 1;
 }
 
-SEC("nvme_ndpm")
 int module(struct nvme_ndp_context *ctx)
 {
 	struct source reader = {
