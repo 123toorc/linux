@@ -6,6 +6,26 @@
 #define COPY_2_BYTE_OFFSET 2
 #define COPY_4_BYTE_OFFSET 3
 
+static u16 char_table(int i) {
+	int type = i % 4;
+	int v = i / 4;
+	if (type == 0) {
+		if (v == 0x3c) return 0x0801;
+		if (v == 0x3d) return 0x1001;
+		if (v == 0x3e) return 0x1801;
+		if (v == 0x3f) return 0x2001;
+		return v + 1;
+	}
+
+	if (type == 1) {
+		int b = v % 8 + 4;
+		int a = (v / 8 + 8) << 8;
+		return a + b;
+	}
+
+	return ((type - 1) << 12) + v + 1;
+}
+
 struct source {
 	const char *ptr;
 	size_t left;
@@ -17,64 +37,7 @@ struct writer {
 	char *op_limit;
 };
 
-static u16 char_table(int i) {
-	int type = i % 4;
-	int v = i / 4;
-	if (type == 0) {
-		if (v == 0x3d) return 0x0801;
-		if (v == 0x3e) return 0x1001;
-		if (v == 0x3f) return 0x1801;
-		if (v == 0x40) return 0x2001;
-		return v;
-	}
-
-	if (type == 1) {
-		int b = v % 8 + 4;
-		int a = (v / 8 + 8) << 8;
-		return a + b;
-	}
-
-	return ((type - 1) << 12) + v;
-}
-
-static inline void copy64(const void *src, void *dst)
-{
-	*((long*)dst) = *((long*)src);
-}
-
-static void incremental_copy_fast_path(const char *src, char *op,
-					      int len)
-{
-	while (op - src < 8) {
-		copy64(src, op);
-		len -= op - src;
-		op += op - src;
-	}
-	while (len > 0) {
-		copy64(src, op);
-		src += 8;
-		op += 8;
-		len -= 8;
-	}
-}
-
-static void incremental_copy(const char *src, char *op, int len)
-{
-	do {
-		*op++ = *src++;
-	} while (--len > 0);
-}
-static inline void writer_set_expected_length(struct writer *w, size_t len)
-{
-	w->op_limit = w->op + len;
-}
-
-static inline bool writer_check_length(struct writer *w)
-{
-	return w->op == w->op_limit;
-}
-
-static void movedata(void *dest, const void* src, u32 len)
+static inline void movedata(void *dest, const void* src, u32 len)
 {
 	int i = 0;
 	char *d = (char*)dest, *s = (char*)src;
@@ -83,30 +46,23 @@ static void movedata(void *dest, const void* src, u32 len)
 	}
 }
 
-static bool writer_append_from_self(struct writer *w, u32 offset,
+static inline void writer_set_expected_length(struct writer *w, size_t len)
+{
+	w->op_limit = w->op + len;
+}
+
+static inline bool writer_append_from_self(struct writer *w, u32 offset,
 					   u32 len)
 {
 	char *const op = w->op;
 	const u32 space_left = w->op_limit - op;
 
-	if (op - w->base <= offset - 1u)	/* -1u catches offset==0 */
+	if (op - w->base <= offset - 1u)
 		return false;
-	if (len <= 16 && offset >= 8 && space_left >= 16) {
-		/* Fast path, used for the majority (70-80%) of dynamic
-		 * invocations. */
-		copy64(op - offset, op);
-		copy64(op - offset + 8, op + 8);
-	} else {
-		if (space_left >= len + 10) {
-			incremental_copy_fast_path(op - offset, op, len);
-		} else {
-			if (space_left < len) {
-				return false;
-			}
-			incremental_copy(op - offset, op, len);
-		}
-	}
+	if (space_left < len)
+		return false;
 
+	movedata(op, op - offset, len);
 	w->op = op + len;
 	return true;
 }
@@ -131,13 +87,13 @@ struct snappy_decompressor {
 	char scratch[5];	/* Temporary buffer for peekfast boundaries */
 };
 
-static const char *peek(struct source *s, size_t * len)
+static inline const char *peek(struct source *s, size_t * len)
 {
 	*len = s->left;
 	return s->ptr;
 }
 
-static void skip(struct source *s, size_t n)
+static inline void skip(struct source *s, size_t n)
 {
 	s->left -= n;
 	s->ptr += n;
@@ -151,11 +107,6 @@ init_snappy_decompressor(struct snappy_decompressor *d, struct source *reader)
 	d->ip_limit = NULL;
 	d->peeked = 0;
 	d->eof = false;
-}
-
-static void exit_snappy_decompressor(struct snappy_decompressor *d)
-{
-	skip(d->reader, d->peeked);
 }
 
 static bool read_uncompressed_length(struct snappy_decompressor *d,
@@ -187,8 +138,8 @@ static bool refill_tag(struct snappy_decompressor *d)
 
 	if (ip == d->ip_limit) {
 		size_t n;
-		/* Fetch a new fragment from the reader */
-		skip(d->reader, d->peeked); /* All peeked bytes are used up */
+	
+		skip(d->reader, d->peeked);
 		ip = peek(d->reader, &n);
 		d->peeked = n;
 		if (n == 0) {
@@ -198,23 +149,15 @@ static bool refill_tag(struct snappy_decompressor *d)
 		d->ip_limit = ip + n;
 	}
 
-	/* Read the tag character */
 	const unsigned char c = *(const unsigned char *)(ip);
 	const u32 entry = char_table(c);
-	const u32 needed = (entry >> 11) + 1;	/* +1 byte for 'c' */
+	const u32 needed = (entry >> 11) + 1;
 
-	/* Read more bytes from reader if needed */
 	u32 nbuf = d->ip_limit - ip;
 
 	if (nbuf < needed) {
-		/*
-		 * Stitch together bytes from ip and reader to form the word
-		 * contents.  We store the needed bytes in "scratch".  They
-		 * will be consumed immediately by the caller since we do not
-		 * read more than we need.
-		 */
 		movedata(d->scratch, ip, nbuf);
-		skip(d->reader, d->peeked); /* All peeked bytes are used up */
+		skip(d->reader, d->peeked);
 		d->peeked = 0;
 		while (nbuf < needed) {
 			size_t length;
@@ -230,17 +173,12 @@ static bool refill_tag(struct snappy_decompressor *d)
 		d->ip = d->scratch;
 		d->ip_limit = d->scratch + needed;
 	} else if (nbuf < 5) {
-		/*
-		 * Have enough bytes, but move into scratch so that we do not
-		 * read past end of input
-		 */
 		movedata(d->scratch, ip, nbuf);
-		skip(d->reader, d->peeked); /* All peeked bytes are used up */
+		skip(d->reader, d->peeked);
 		d->peeked = 0;
 		d->ip = d->scratch;
 		d->ip_limit = d->scratch + nbuf;
 	} else {
-		/* Pass pointer to buffer returned by reader. */
 		d->ip = ip;
 	}
 	return true;
@@ -252,15 +190,8 @@ static void decompress_all_tags(struct snappy_decompressor *d,
 	const u32 wordmask[] = {
 		0u, 0xffu, 0xffffu, 0xffffffu, 0xffffffffu
 	};
-
 	const char *ip = d->ip;
 
-	/*
-	 * We could have put this refill fragment only at the beginning of the loop.
-	 * However, duplicating it at the end of each branch gives the compiler more
-	 * scope to optimize the <ip_limit_ - ip> expression based on the local
-	 * context, which overall increases speed.
-	 */
 #define MAYBE_REFILL() \
         if (d->ip_limit - ip < 5) {		\
 		d->ip = ip;			\
@@ -283,7 +214,6 @@ static void decompress_all_tags(struct snappy_decompressor *d,
 		if ((c & 0x3) == LITERAL) {
 			u32 literal_length = (c >> 2) + 1;
 			if (literal_length >= 61) {
-				/* Long literal */
 				const u32 literal_ll = literal_length - 60;
 				literal_length = (*((u32 *)(ip)) &
 						  wordmask[literal_ll]) + 1;
@@ -301,7 +231,7 @@ static void decompress_all_tags(struct snappy_decompressor *d,
 				avail = n;
 				d->peeked = avail;
 				if (avail == 0)
-					return;	/* Premature end of input */
+					return;
 				d->ip_limit = ip + avail;
 			}
 			if (!writer_append(writer, ip, literal_length))
@@ -315,12 +245,6 @@ static void decompress_all_tags(struct snappy_decompressor *d,
 			const u32 length = entry & 0xff;
 			ip += entry >> 11;
 
-			/*
-			 * copy_offset/256 is encoded in bits 8..10.
-			 * By just fetching those bits, we get
-			 * copy_offset (since the bit-field starts at
-			 * bit 8).
-			 */
 			const u32 copy_offset = entry & 0x700;
 			if (!writer_append_from_self(writer,
 						     copy_offset + trailer,
@@ -343,19 +267,15 @@ static int internal_uncompress(struct source *r,
 
 	if (!read_uncompressed_length(&decompressor, &uncompressed_len))
 		return 1;
-	/* Protect against possible DoS attack */
+
 	if ((u64) (uncompressed_len) > max_len)
 		return 1;
 
 	writer_set_expected_length(writer, uncompressed_len);
 
-	/* Process the entire input */
 	decompress_all_tags(&decompressor, writer);
-
-	exit_snappy_decompressor(&decompressor);
-	if (writer_check_length(writer))
-		return 0;
-	return 1;
+	
+	return 0;
 }
 
 int module(struct nvme_ndp_context *ctx)
