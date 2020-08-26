@@ -1,12 +1,17 @@
 #include <uapi/linux/bpf.h>
 #include <bpf/bpf_helpers.h>
 
+#ifndef __inline
+# define __inline                         \
+   inline __attribute__((always_inline))
+#endif
+
 #define LITERAL 0
 #define COPY_1_BYTE_OFFSET 1
 #define COPY_2_BYTE_OFFSET 2
 #define COPY_4_BYTE_OFFSET 3
 
-static u16 char_table(int i) {
+static __inline u16 char_table(int i) {
 	int type = i % 4;
 	int v = i / 4;
 	if (type == 0) {
@@ -37,7 +42,7 @@ struct writer {
 	char *op_limit;
 };
 
-static inline void movedata(void *dest, const void* src, u32 len)
+static __inline void movedata(void *dest, const void* src, u32 len)
 {
 	int i = 0;
 	char *d = (char*)dest, *s = (char*)src;
@@ -46,12 +51,12 @@ static inline void movedata(void *dest, const void* src, u32 len)
 	}
 }
 
-static inline void writer_set_expected_length(struct writer *w, size_t len)
+static __inline void writer_set_expected_length(struct writer *w, size_t len)
 {
 	w->op_limit = w->op + len;
 }
 
-static inline bool writer_append_from_self(struct writer *w, u32 offset,
+static __inline bool writer_append_from_self(struct writer *w, u32 offset,
 					   u32 len)
 {
 	char *const op = w->op;
@@ -67,7 +72,7 @@ static inline bool writer_append_from_self(struct writer *w, u32 offset,
 	return true;
 }
 
-static inline bool writer_append(struct writer *w, const char *ip, u32 len)
+static __inline bool writer_append(struct writer *w, const char *ip, u32 len)
 {
 	char *const op = w->op;
 	const u32 space_left = w->op_limit - op;
@@ -87,19 +92,19 @@ struct snappy_decompressor {
 	char scratch[5];	/* Temporary buffer for peekfast boundaries */
 };
 
-static inline const char *peek(struct source *s, size_t * len)
+static __inline const char *peek(struct source *s, size_t * len)
 {
 	*len = s->left;
 	return s->ptr;
 }
 
-static inline void skip(struct source *s, size_t n)
+static __inline void skip(struct source *s, size_t n)
 {
 	s->left -= n;
 	s->ptr += n;
 }
 
-static void
+static __inline void
 init_snappy_decompressor(struct snappy_decompressor *d, struct source *reader)
 {
 	d->reader = reader;
@@ -109,7 +114,7 @@ init_snappy_decompressor(struct snappy_decompressor *d, struct source *reader)
 	d->eof = false;
 }
 
-static bool read_uncompressed_length(struct snappy_decompressor *d,
+static __inline bool read_uncompressed_length(struct snappy_decompressor *d,
 				     u32 * result)
 {
 	*result = 0;
@@ -132,7 +137,7 @@ static bool read_uncompressed_length(struct snappy_decompressor *d,
 	return true;
 }
 
-static bool refill_tag(struct snappy_decompressor *d)
+static __inline bool refill_tag(struct snappy_decompressor *d)
 {
 	const char *ip = d->ip;
 
@@ -184,7 +189,7 @@ static bool refill_tag(struct snappy_decompressor *d)
 	return true;
 }
 
-static void decompress_all_tags(struct snappy_decompressor *d,
+static __inline void decompress_all_tags(struct snappy_decompressor *d,
 				struct writer *writer)
 {
 	const u32 wordmask[] = {
@@ -257,7 +262,7 @@ static void decompress_all_tags(struct snappy_decompressor *d,
 
 #undef MAYBE_REFILL
 
-static int internal_uncompress(struct source *r,
+static __inline int internal_uncompress(struct source *r,
 			       struct writer *writer, u32 max_len)
 {
 	struct snappy_decompressor decompressor;
