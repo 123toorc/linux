@@ -1,8 +1,8 @@
 #include <uapi/linux/bpf.h>
 #include <bpf/bpf_helpers.h>
 
-#define PATTERN "Alice"
-#define PATTERN_LEN 5
+#define PATTERN "though"
+#define PATTERN_LEN 6
 
 int module(struct nvme_ndp_context *ctx)
 {
