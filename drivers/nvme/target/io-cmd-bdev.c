@@ -140,20 +140,44 @@ static u16 blk_to_nvme_status(struct nvmet_req *req, blk_status_t blk_sts)
 static void nvmet_bio_done(struct bio *bio)
 {
 	struct nvmet_req *req = bio->bi_private;
-
+//protocol overview
+//Command Dword (CDW) 10 to 15 will be used for various purpose for each type of commands
+//CDW 10 and CDW 11 combined indicates the 64-bit address of the first logical block, or Starting Logical Block Address (SLBA)
+/*
+struct nvme_common_command {
+	__u8			opcode;     Command Dword 0 (CDW0)
+	__u8			flags;      Command Dword 0 (CDW0)
+	__u16			command_id; Command Dword 0 (CDW0)
+	__le32			nsid;       Namespace Identifier (NSID)
+	__le32			cdw2[2];    Reserved -> 
+	__le64			metadata;   Metadata Pointer (MPTR)
+	union nvme_data_ptr	dptr;       Data Pointer (DPTR)
+	__le32			cdw10;      Command Dword 10
+	__le32			cdw11;
+	__le32			cdw12;
+	__le32			cdw13;
+	__le32			cdw14;
+	__le32			cdw15;
+};
+*/
 #ifdef CONFIG_NVME_TARGET_NDP_MODULE
 	struct ndp_module *ndpm = req->ns->ndpm;
 	// TODO: multiple progs
-	u32 prog_id = le32_to_cpu(req->cmd->common.cdw2[0]);
+	u32 prog_id = le32_to_cpu(req->cmd->common.cdw2[0]); 
+	//NDP Active: This field specify whether to call the code
+	//module attached to the namespace. (0: Inactive, 1-15: Active)
 	u32 max_iter = le32_to_cpu(req->cmd->common.cdw2[1]);
+	//Max Iteration: This field specify the maximum number of iteration
+	//allowed to run code module during a read/write operation.
+	
 	bool active = prog_id && ndpm;
 	int res, i;
 
-	printk("done: prog_id: %d, max_iter: %d\n", prog_id, max_iter);
+	printk(KERN_INFO,"done: prog_id: %d, max_iter: %d\n", prog_id, max_iter);
 
 	if (active) {
-		if (ndpm->ctx.out_data) {
-			if (ndpm->ctx.op == REQ_OP_READ) {
+		if (ndpm->ctx.out_data) { //if outdata pointer is not null. 
+			if (ndpm->ctx.op == REQ_OP_READ) {   
 				for (i = 0; i < max_iter; ++i) {
 					res = BPF_PROG_RUN(ndpm->prog, &ndpm->ctx);
 					if (res) {
@@ -170,10 +194,11 @@ static void nvmet_bio_done(struct bio *bio)
 				}
 
 				if (req->transfer_len == ndpm->ctx.out_data_len) {
-					printk("transfer len mismatch %d %d\n", req->transfer_len, ndpm->ctx.out_data_len);
+					printk(KERN_INFO,"transfer len match %d %d\n", req->transfer_len, ndpm->ctx.out_data_len); //???
 					nvmet_copy_to_sgl(req, 0, ndpm->ctx.out_data, ndpm->ctx.out_data_len);
 				}
-				// TODO: report error when transfer_len != out_data_len
+				else 
+					printk(KERN_INFO,"transfer len match %d %d\n");// TODO: report error when transfer_len != out_data_len
 			}
 			vfree(ndpm->ctx.out_data);
 		}
@@ -189,28 +214,32 @@ static void nvmet_bio_done(struct bio *bio)
 #ifdef CONFIG_NVME_TARGET_NDP_MODULE
 
 // TODO: combine rw?
+//Once the module is attached, the read and write 
+//command will have access to the NDP module.
 static void nvmet_bdev_execute_ndp_write(struct nvmet_req *req)
 {
 	int sg_cnt = req->sg_cnt;
 	struct ndp_module *ndpm = req->ns->ndpm;
 
 	struct bio *bio;
-	struct scatterlist *sg;
+	struct scatterlist *sg; 
 	struct blk_plug plug;
 	sector_t sector;
 	int op, i, nent;
 
 	// TODO: multiple progs
+	// To prepare an NDP-enabled read/write procedure,
+	// we read the reserved field (Table 3.2) in the NVMe command. 
 	u32 prog_id = le32_to_cpu(req->cmd->common.cdw2[0]);
 	u32 max_iter = le32_to_cpu(req->cmd->common.cdw2[1]);
 	bool active = prog_id && ndpm;
 
-	struct sg_table out_sgt;
+	struct sg_table out_sgt; 
 	struct page *vm_page;
 	void *buf;
 	int res, min, len;
 
-	struct scatterlist *sgl;
+	struct scatterlist *sgl; 
 
 	size_t sgl_len = req->transfer_len;
 	u32 blk_len = nvmet_rw_len(req);
@@ -227,9 +256,10 @@ static void nvmet_bdev_execute_ndp_write(struct nvmet_req *req)
 
 	op = REQ_OP_WRITE | REQ_SYNC | REQ_IDLE;
 	if (req->cmd->rw.control & cpu_to_le16(NVME_RW_FUA))
-		op |= REQ_FUA;
-
-	sector = le64_to_cpu(req->cmd->rw.slba);
+		op |= REQ_FUA; //force union access
+	//CDW 10 and CDW 11 combined indicates the 64-bit address of 
+	//the first logical block, or Starting Logical Block Address (SLBA)
+	sector = le64_to_cpu(req->cmd->rw.slba); 
 	sector <<= (req->ns->blksize_shift - 9);
 
 	if (req->transfer_len <= NVMET_MAX_INLINE_DATA_LEN) {
@@ -242,7 +272,7 @@ static void nvmet_bdev_execute_ndp_write(struct nvmet_req *req)
 	if (active) {
 		ndpm->ctx.op = REQ_OP_WRITE;
 		ndpm->ctx.in_data = vmalloc(sgl_len);
-		nvmet_copy_from_sgl(req, 0, ndpm->ctx.in_data, sgl_len);
+		nvmet_copy_from_sgl(req, 0, ndpm->ctx.in_data, sgl_len); //sgl->ctx.in_data
 		ndpm->ctx.in_data_len = sgl_len;
 
 		ndpm->ctx.out_data = vzalloc(blk_len);
@@ -267,12 +297,19 @@ static void nvmet_bdev_execute_ndp_write(struct nvmet_req *req)
 			}
 		}
 		
-		printk("HACK: applying ebpf (write), res: %d\n", res);
+		printk(KERN_INFO, "HACK: applying ebpf (write), res: %d\n", res);
 
 		// to be safe
-		ndpm->ctx.op = REQ_OP_WRITE;
-
-		// Create SG
+		// TODO: fix this code.
+		ndpm->ctx.op = REQ_OP_WRITE; 
+		/*
+		* allocate two dedicated input and output buffers, 
+		* and construct an SGL representing either the input or output buffer, 
+		* depends on whether it is a read or write operation,
+		* to be passed on to the block abstraction layer.
+		* Create SG
+		* @nents: Number of SG entries
+		*/
 		nent = DIV_ROUND_UP(blk_len + offset_in_page(ndpm->ctx.out_data), PAGE_SIZE);
 
 		sg_alloc_table(&out_sgt, nent, GFP_KERNEL);
@@ -292,7 +329,20 @@ static void nvmet_bdev_execute_ndp_write(struct nvmet_req *req)
 					nvmet_req_complete(req, 0); // TODO: report error
 					return;
 				}
-
+				/**
+				 * sg_set_page - Set sg entry to point at given page
+				 * @sg:		 SG entry
+				 * @page:	 The page
+				 * @len:	 Length of data
+				 * @offset:	 Offset into page
+				 *
+				 * Description:
+				 *   Use this function to set an sg entry pointing at a page, never assign
+				 *   the page directly. We encode sg table information in the lower bits
+				 *   of the page pointer. See sg_page() for looking up the page belonging
+				 *   to an sg entry.
+				 *
+				 **/
 				sg_set_page(sg, vm_page,
 						min, offset_in_page(buf));
 
@@ -302,7 +352,10 @@ static void nvmet_bdev_execute_ndp_write(struct nvmet_req *req)
 		}
 
 		sgl = out_sgt.sgl;
-	} else {
+	} 
+	// If a code module exists and is activated, 
+	// the data symmetry check is disabled.
+	else {
 		sgl = req->sg;
 		nent = req->sg_cnt;
 		
@@ -385,7 +438,7 @@ static void nvmet_bdev_execute_ndp_read(struct nvmet_req *req)
 	sector = le64_to_cpu(req->cmd->rw.slba);
 	sector <<= (req->ns->blksize_shift - 9);
 
-	if (req->transfer_len <= NVMET_MAX_INLINE_DATA_LEN) {
+	if (req->transfer_len <= NVMET_MAX_INLINE_DATA_LEN) 	{
 		bio = &req->b.inline_bio;
 		bio_init(bio, req->inline_bvec, ARRAY_SIZE(req->inline_bvec));
 	} else {
@@ -686,9 +739,11 @@ static void ndp_module_remove(struct nvmet_req *req) {
 
 static void ndp_module_dl_volatile(struct nvmet_req *req) {
 	u32 cdw10 = le32_to_cpu(req->cmd->common.cdw10);
-	u32 code_len = cdw10;
+	// Number of Dwords (NUMD): This field specifies the number of
+	// Dwords to transfer for the module’s image.
+	u32 code_len = cdw10; 
 	int insn_cnt = code_len / sizeof(struct bpf_insn);
-	struct bpf_prog *fp;
+	struct bpf_prog *fp;  
 	int err = 0;
 
 	if (insn_cnt > U16_MAX) {
@@ -755,8 +810,8 @@ static void ndp_module_dl_volatile(struct nvmet_req *req) {
 static void nvmet_bdev_execute_ndp_module_mgmt(struct nvmet_req *req)
 {
 	u32 cdw11 = le32_to_cpu(req->cmd->common.cdw11);
-	u8 eft = cdw11 & 0xFFFF;
-	u8 persist = (cdw11 >> 4) & 0xFF;
+	u8 eft = cdw11 & 0xFFFF; 
+	u8 persist = (cdw11 >> 4) & 0xFF; 
 	u8 shared = (cdw11 >> 6) & 0xFF;
 	u8 sub_cmd = (cdw11 >> 8) & 0xFFFF;
 
